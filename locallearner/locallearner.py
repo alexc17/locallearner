@@ -76,16 +76,7 @@ class LocalLearner:
 		self.posterior_threshold= 0.9
 
 
-	def learn(self,binary_mode='renyi',verbose=True):
-		"""
-		returns a PCFG that approximates the conditional distribution of trees given strings.
-
-		one given hyper parameter: the number of nonterminals.
-		This avoids the use of an RNN to detect termination.
-		"""
-		## Computed quantities from hyperparams
-		self.binary_smoothing = 1.0 / ( self.number_tokens * self.nonterminals ** 2)
-		self.unary_smoothing = 1.0 / ( self.number_tokens * self.alphabet_size)
+	def find_kernels(self,verbose=True):
 		self.stride =  (self.number_clusters + 1)
 		self.number_features = 2 * self.width *self.stride
 		
@@ -98,6 +89,66 @@ class LocalLearner:
 		print(self.kernels)
 		for a in self.kernels[1:]:
 			print(a, self.clusters[a])
+		return self.kernels
+
+	def learn_wcfg_from_kernels_renyi(self,kernels, verbose=True):
+		"""
+		We alread have the kernels.
+		returns a PCFG that approximates the conditional distribution of trees given strings.
+
+		"""
+		## Computed quantities from hyperparams
+		self.stride =  (self.number_clusters + 1)
+		self.number_features = 2 * self.width *self.stride
+		
+		print("Ney Essen clustering (again)")
+		self.do_clustering()
+		self.set_start_vector()
+		self.compute_unigram_features()
+		#self.kernels = kernels
+		self.binary_smoothing = 1.0 / ( self.number_tokens * self.nonterminals ** 2)
+		self.unary_smoothing = 1.0 / ( self.number_tokens * self.alphabet_size)
+		self.init_nmf_with_kernels(kernels)
+		print("Estimating unary parameters: FW ")
+		self.compute_unary_parameters_fw()
+		
+		print("Computing clustered bigram features with posterior threshold ", self.posterior_threshold)
+		self.compute_clustered_bigram_features()
+		
+		print("Estimating binary parameters: Renyi")
+		self.compute_binary_parameters_renyi()
+		
+		# for a in self.kernels:
+		# 	for b in self.kernels[1:]:
+		# 		for c in self.kernels[1:]:
+		# 			print(a,"->",b,c,"=", self.binary_parameters[(a,b,c)])
+		self.set_nonterminal_labels()
+		self.make_raw_wcfg()
+		#self.make_pcfg()
+		return self.output_grammar
+
+	def learn(self,binary_mode='renyi',verbose=True):
+		"""
+		returns a PCFG that approximates the conditional distribution of trees given strings.
+
+		one given hyper parameter: the number of nonterminals.
+		This avoids the use of an RNN to detect termination.
+		"""
+		## Computed quantities from hyperparams
+		self.find_kernel(verbose=verbose)
+		self.binary_smoothing = 1.0 / ( self.number_tokens * self.nonterminals ** 2)
+		self.unary_smoothing = 1.0 / ( self.number_tokens * self.alphabet_size)
+		# self.stride =  (self.number_clusters + 1)
+		# self.number_features = 2 * self.width *self.stride
+		
+		# print("Ney Essen clustering.")
+		# self.do_clustering()
+		# self.set_start_vector()
+		# self.compute_unigram_features()
+		# print("Non negative matrix factorisation.")
+		# self.do_nmf(verbose=verbose)
+		# print(self.kernels)
+		
 		print("Estimating unary parameters: Frank-Wolfe ")
 		self.compute_unary_parameters_fw()
 		#print(self.unary_parameters)
@@ -234,6 +285,28 @@ class LocalLearner:
 		self.bigram_feature_sums_right = np.sum(self.bigram_features,axis=(0,2))
 
 
+
+	def init_nmf_with_kernels(self, kernels):
+		## Given known clusters initialise the NMF so we can do the Frank-Wolfe estimation
+		## for the unary rules.
+		fidx = []
+		fwords = []
+		for i,w in enumerate(self.idx2word):
+			fidx.append(i)
+			fwords.append(w)
+		fidx.append(self.alphabet_size)
+		fwords.append(self.start_symbol)
+		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=0)
+		## This may not be the start symbol of the grammar.
+
+		start_idx = len(fidx)-1
+		self.nmf.start(start_idx)
+		self.kernels = [ kernels[0] ]
+		for a in kernels[1:]:
+			ai = self.word2idx[a]
+			self.nmf.add_basis(ai)
+			self.kernels.append(a)
+		self.nmf.initialise_frank_wolfe()
 
 	def do_nmf(self,verbose=False):
 		## Filter out the low frequency ones.
