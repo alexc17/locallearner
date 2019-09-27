@@ -831,6 +831,7 @@ class WCFG:
 		"""
 		totals = self.check_local_normalisation()
 		beta = max(totals.values())
+		print("Beta factor", beta)
 		## scale everything by beta.
 		if beta > 1:
 			logging.info("Scaling all productions by factor of %f", beta)
@@ -840,6 +841,7 @@ class WCFG:
 			pcfg1.set_log_parameters()
 			return pcfg1
 		else:
+
 			logging.info("Not doing anything : beta = %f", beta)
 			return self
 

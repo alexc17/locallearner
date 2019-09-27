@@ -15,9 +15,10 @@ mywcfg = wcfg.load_wcfg_from_file(args.input)
 
 
 if not mywcfg.is_convergent():
-	print("Renomalising divergent WCFG")
+	print("Renormalising divergent WCFG")
 	mywcfg = mywcfg.renormalise_divergent_wcfg2()
 
+assert mywcfg.is_convergent()
 mywcfg.renormalise()
 mywcfg.store(args.output)
 
