@@ -48,7 +48,7 @@ maxlength = 10
 
 
 %.final_mjio : %.1mjio %.strings 
-	../bin/io -l $(maxlength) -p 1e-8 -d 1000 -g $^  > $@
+	../bin/io -n 100 -l $(maxlength) -p 1e-8 -d 1000 -g $^  > $@
 
 %.final_pcfg : %.final_mjio
 	python ${srcdir}/convert_mjio_to_pcfg.py $<  $@
@@ -67,7 +67,7 @@ maxlength = 10
 	python ${srcdir}/convert_wcfg_to_pcfg.py $<  $@
 
 %.json :  %.mlpcfg %.1pcfg %.final_pcfg
-	python ${srcdir}/evaluate_pcfg.py --maxlength $(maxlength)  --json $@  --target $^
+	python ${srcdir}/evaluate_pcfg.py --maxlength $(maxlength)  --json $@  --target $*.pcfg $^ 
 
 
 json : $(json_files)
@@ -75,7 +75,7 @@ json : $(json_files)
 # allkernels : $(kernel_files)
 
 clean : 
-	rm $(datadirs)/*.{json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg}
+	rm -f $(datadirs)/*.{json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg,final_pcfg,final_mjio,mlpcfg,0mjio,1mjio}
 
 .PHONY : json clean 
 
