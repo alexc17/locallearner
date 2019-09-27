@@ -17,7 +17,10 @@ mywcfg = wcfg.load_wcfg_from_file(args.input)
 if not mywcfg.is_convergent():
 	print("Renormalising divergent WCFG")
 	mywcfg = mywcfg.renormalise_divergent_wcfg2()
+	print(mywcfg.check_local_normalisation())
+	print(mywcfg.compute_partition_function_fp())
 
+	print(mywcfg.compute_partition_function_fast())
 assert mywcfg.is_convergent()
 mywcfg.renormalise()
 mywcfg.store(args.output)

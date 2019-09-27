@@ -21,7 +21,7 @@ EPSILON = 1e-15
 BIG_EPSILON = 1e-10
 MAX_PARTITION_FUNCTION = 1e100
 PARTITION_FUNCTION_MAX_ITERATIONS=100
-PARTITION_FUNCTION_EPSILON=1e-20
+PARTITION_FUNCTION_EPSILON=1e-10
 SAMPLE_MAX_DEPTH=100
 SAMPLE_CACHE_SIZE=1000
 MIN_PROB = 1e-10
@@ -536,7 +536,7 @@ class WCFG:
 
 		Remove ones with zero parameters.
 		"""
-		rn = self.compute_partition_function_fast()
+		rn = self.compute_partition_function_fp()
 		for prod in self.productions:
 			if rn[prod[0]] == 0:
 				self.parameters[prod] = 0
@@ -595,7 +595,7 @@ class WCFG:
 			return J
 
 		for i in range(PARTITION_FUNCTION_MAX_ITERATIONS):
-			#print(x)
+			print(x)
 			y = f(x)
 			jacobian = J(x)
 			cn = np.linalg.cond(J(x))
@@ -609,6 +609,7 @@ class WCFG:
 			if numpy.linalg.norm(x - x1, 1) < PARTITION_FUNCTION_EPSILON:
 				return { nt : x[ntindex[nt]] for nt in self.nonterminals}
 			x = x1
+
 		raise ValueError("failed to converge")
 		
 
