@@ -28,46 +28,46 @@ maxlength = 10
 # 	python ../testpcfg/convert_wcfg_to_mjio.py $<  $@
 
 %.strings : %.trees
-	python ${srcdir}/convert_trees_to_yields.py $<  $@
+	python ${srcdir}/convert_trees_to_yields.py $<  $@ >> $*.log
 
 %.trees : %.pcfg
-	python ${srcdir}/sample_corpus.py --omitprobs --seed 1 --n 1000000  $<  $@
+	python ${srcdir}/sample_corpus.py --omitprobs --seed 1 --n 1000000  $<  $@ >> $*.log
 
 %.mlpcfg : %.trees
-	python ${srcdir}/convert_trees_to_pcfg.py --length $(maxlength) $<  $@
+	python ${srcdir}/convert_trees_to_pcfg.py --length $(maxlength) $<  $@ >> $*.log
 
 %.0mjio : %.0pcfg
-	python ${srcdir}/convert_pcfg_to_mjio.py $<  $@
+	python ${srcdir}/convert_pcfg_to_mjio.py $<  $@ >> $*.log
 
 
 %.1mjio : %.0mjio %.strings 
-	../bin/io -n 1 -l $(maxlength) -p 1e-8 -d 1000 -g $^  > $@
+	../bin/io -n 1 -l $(maxlength) -p 1e-8 -d 1000 -g $^  > $@ 2>> $*.log
 
 %.1pcfg : %.1mjio
-	python ${srcdir}/convert_mjio_to_pcfg.py $<  $@
+	python ${srcdir}/convert_mjio_to_pcfg.py $<  $@ >> $*.log
 
 
 %.final_mjio : %.1mjio %.strings 
-	../bin/io -n 100 -l $(maxlength) -p 1e-8 -d 1000 -g $^  > $@
+	../bin/io -n 100 -l $(maxlength) -p 1e-8 -d 1000 -g $^  > $@ 2>> $*.log
 
 %.final_pcfg : %.final_mjio
-	python ${srcdir}/convert_mjio_to_pcfg.py $<  $@
+	python ${srcdir}/convert_mjio_to_pcfg.py $<  $@ >> $*.log
 
 %.kernels : %.strings
-	python ${srcdir}/run_find_kernels.py --min_count_nmf 1000  --cheat $*.pcfg $< $@
+	python ${srcdir}/run_find_kernels.py --min_count_nmf 1000  --cheat $*.pcfg $< $@ >> $*.log
 
 %.kjson :  %.kernels
-	python ${srcdir}/evaluate_kernels.py  --json $@  $*.pcfg $< 
+	python ${srcdir}/evaluate_kernels.py  --json $@  $*.pcfg $< >> $*.log
 
 
 %.wcfg : %.strings %.kernels
-	python ${srcdir}/run_make_wcfg.py $^ $@
+	python ${srcdir}/run_make_wcfg.py $^ $@ >> $*.log
 
 %.0pcfg : %.wcfg
-	python ${srcdir}/convert_wcfg_to_pcfg.py $<  $@
+	python ${srcdir}/convert_wcfg_to_pcfg.py $<  $@ >> $*.log
 
 %.json :  %.mlpcfg %.1pcfg %.final_pcfg
-	python ${srcdir}/evaluate_pcfg.py --maxlength $(maxlength)  --json $@  --target $*.pcfg $^ 
+	python ${srcdir}/evaluate_pcfg.py --maxlength $(maxlength)  --json $@  --target $*.pcfg $^  >> $*.log
 
 
 json : $(json_files)
@@ -75,7 +75,7 @@ json : $(json_files)
 # allkernels : $(kernel_files)
 
 clean : 
-	rm -f $(datadirs)/*.{json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg,final_pcfg,final_mjio,mlpcfg,0mjio,1mjio}
+	rm -f $(datadirs)/*.{log,json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg,final_pcfg,final_mjio,mlpcfg,0mjio,1mjio}
 
 .PHONY : json clean 
 
