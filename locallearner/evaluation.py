@@ -14,6 +14,15 @@ from collections import defaultdict
 from collections import Counter
 from scipy.optimize import linear_sum_assignment
 
+
+## Utility functions for using the json files
+
+
+def conditional_entropy(results, model="target"):
+	denominator = results["trees_denominator"]
+	e = (results[f"logprob:{model}:string"]-results[f"logprob:{model}:tree"])/denominator 
+
+
 # def find_bijection(target_pcfg, hypothesis_pcfg):
 # 	"""
 # 	Find a suitable bijection from hypothesis to target.
