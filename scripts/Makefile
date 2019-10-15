@@ -1,5 +1,7 @@
 
-# run this with make -j 36 all for example so that it uses a decent number of processors.
+# run this with 
+# make -j 50 json 
+# for example so that it uses a decent number of processors.
 datadirs = ../data/test*
 pcfg_files = $(wildcard $(datadirs)/*.pcfg)
 json_files = $(patsubst %.pcfg,%.json,$(wildcard $(datadirs)/*.pcfg))
@@ -77,7 +79,10 @@ json : $(json_files)
 clean : 
 	rm -f $(datadirs)/*.{log,json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg,final_pcfg,final_mjio,mlpcfg,0mjio,1mjio}
 
-.PHONY : json clean 
+thin :
+	rm -f $(datadirs)/*.{strings,trees,final_mjio,0mjio,1mjio}	 
+
+.PHONY : json clean thin
 
 # So intermediate files are preserved
 
