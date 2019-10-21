@@ -26,6 +26,7 @@ with open(args.kernels,'r') as inf:
 
 results = set()
 product = 1.0
+te = target.terminal_expectations()
 for a in kernels:
 	if a == 'S':
 		print("Skipping S")
@@ -33,7 +34,7 @@ for a in kernels:
 	else:
 		x = target.find_best_lhs(a)
 		print(x)
-		scores[a] = x
+		scores[a] = (x[0],x[1],te[a])
 		results.add(x[0]) 
 		product *= x[1]
 print(len(results) == len(target.nonterminals))
