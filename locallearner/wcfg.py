@@ -927,6 +927,32 @@ class WCFG:
 		pcfg1.set_log_parameters()
 		return pcfg1
 
+
+	def smooth_full(self, lexicon, epsilon):
+		"""
+		nondestructively smooth this grammar by 
+		adding all possible rules using this lexicon,
+		"""
+		mywcfg = self.copy()
+		def add(prod):
+			if prod in mywcfg.parameters:
+				mywcfg.parameters[prod] += epsilon
+			else:
+				mywcfg.productions.append(prod)
+				mywcfg.parameters[prod] = epsilon
+		for a in self.nonterminals:
+			for b in self.nonterminals:
+				for c in self.nonterminals:
+					if b != self.start and c != self.start:
+						prod = (a,b,c)
+						add(prod)
+			for b in lexicon:
+				prod = (a,b)
+				add(prod)
+		mywcfg.terminals = lexicon
+		mywcfg.locally_normalise()
+		return mywcfg
+
 	def intersect(self, target):
 		""" 
 		return a new WCFG that always generates a.

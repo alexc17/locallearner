@@ -125,10 +125,10 @@ def estimate_bijection(target_pcfg, hypothesis_pcfg, samples = 1000, seed=None, 
 				collect_nonterminal_pairs(tree, learned,c)
 			except utility.ParseFailureException:
 				print("Failed",s)
-	print(c)	
+	#print(c)	
 
 	maximum_value = max(  max( c2.values()) for nt,c2 in c.items())
-	print(maximum_value)
+	#print(maximum_value)
 	## Now use the Hungarian algorithm 
 
 	cost_matrix  = np.zeros((n,n))
@@ -146,7 +146,7 @@ def estimate_bijection(target_pcfg, hypothesis_pcfg, samples = 1000, seed=None, 
 	answer = {}
 	for i,j in zip(row_ind,col_ind):
 		answer[ target_list[i]] = hypothesis_list[j]
-	print(answer)
+	#print(answer)
 	return answer
 
 def collect_nonterminal_pairs(tree1, tree2, counter):
@@ -209,6 +209,16 @@ def length_kld(target, hypothesis, l):
 	except ValueError as e:
 		return math.inf
 	
+def smoothed_kld_exact(target, hypothesis,epsilon=1e-6, compute_bijection = False):
+	lexicon = list(target.terminals)
+	smoothed = hypothesis.smooth_full(lexicon,epsilon)
+	if compute_bijection:
+		bijection = estimate_bijection(target, hypothesis)
+	else:
+		bijection = { a:a for a in target.nonterminals}
+	return labeled_kld_exact(target,smoothed,injection=bijection)
+
+
 
 def labeled_kld_exact(target, hypothesis, injection=None,verbose=False):
 	"""
@@ -218,7 +228,11 @@ def labeled_kld_exact(target, hypothesis, injection=None,verbose=False):
 	We can compute this in closed form.
 	"""
 	# check it is an injection
-	if not injection:
+	if injection:
+		N = len(target.nonterminals)
+		assert injection[target.start] == hypothesis.start
+		assert len(injection.values()) == N
+	else:
 		injection = { a:a for a in target.nonterminals}
 	pe = target.production_expectations()
 	kld = 0.0
@@ -230,6 +244,7 @@ def labeled_kld_exact(target, hypothesis, injection=None,verbose=False):
 		else:
 			newprod = (injection[prod[0]], injection[prod[1]],injection[prod[2]])
 		if not newprod in hypothesis.parameters:
+			print("Failure newprod", newprod)
 			return math.inf
 		else:
 			beta = hypothesis.parameters[newprod]
@@ -423,6 +438,9 @@ def bracketed_kld(target, hypothesis, samples= 1000,  max_length = 30, seed = No
 			print("Sample %d %s, target %f, hypothesis %f" % (i,t,lp,lq))
 	monte_carlo(target,f,samples,max_length,seed)
 	return total/n
+
+
+
 
 def labeled_exact_match(target, hypothesis, samples = 1000, max_length = 30, viterbi = False, verbose=False,seed = None):
 	"""

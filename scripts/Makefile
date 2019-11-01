@@ -9,6 +9,8 @@ kernel_files = $(patsubst %.pcfg,%.kernels,$(wildcard $(datadirs)/*.pcfg))
 srcdir = ../locallearner
 
 maxlength = 10
+evallength = 20
+
 #suffixes = json kjson strings trees wcfg 0pcfg 1pcfg 
 
 # List of file types
@@ -34,6 +36,9 @@ maxlength = 10
 
 %.trees : %.pcfg
 	python ${srcdir}/sample_corpus.py --omitprobs --seed 1 --n 1000000  $<  $@ >> $*.log
+
+%.sigma : %.pcfg
+	python ${srcdir}/save_terminals.py $<  $@ >> $*.log
 
 %.mlpcfg : %.trees
 	python ${srcdir}/convert_trees_to_pcfg.py --length $(maxlength) $<  $@ >> $*.log
@@ -68,8 +73,8 @@ maxlength = 10
 %.0pcfg : %.wcfg
 	python ${srcdir}/convert_wcfg_to_pcfg.py $<  $@ >> $*.log
 
-%.json :  %.mlpcfg %.1pcfg %.final_pcfg
-	python ${srcdir}/evaluate_pcfg.py --maxlength $(maxlength)  --json $@  --target $*.pcfg $^  >> $*.log
+%.json :  %.mlpcfg %.0pcfg %.1pcfg %.final_pcfg
+	python ${srcdir}/evaluate_pcfg.py --maxlength $(evallength)  --json $@  --target $*.pcfg $^  >> $*.log
 
 
 json : $(json_files)

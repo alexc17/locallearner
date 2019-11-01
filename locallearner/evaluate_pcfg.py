@@ -110,8 +110,8 @@ for i,hypothesis in enumerate(hypotheses):
 	pf = hypothesis.compute_partition_function_fp()[hypothesis.start]
 	print("Partition function: %f log partition function %f " % (pf,math.log(pf)))
 
-	lkld = evaluation.labeled_kld_exact(target,hypothesis)
-	print("exact KLD  %f  " % lkld)
+	lkld = evaluation.smoothed_kld_exact(target,hypothesis)
+	print("exact smoothed KLD  %f  " % lkld)
 	scores["exactkld:hypothesis%d" % i] = lkld
 	lengthkld = evaluation.length_kld(target, hypothesis, args.maxlength * 2)
 	print("Length KLD", lengthkld)
