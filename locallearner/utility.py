@@ -303,7 +303,7 @@ def strongly_connected_components(graph):
 		# Consider successors of `node`
 		try:
 			successors = graph[node]
-		except:
+		except KeyError:
 			successors = []
 		for successor in successors:
 			if successor not in lowlinks:
@@ -430,27 +430,6 @@ def random_binary_tree_labeled(sentence, labels, root=True):
 			right = random_binary_tree_labeled(sentence[left_tree_size:],labels, root=False)
 			return (label, left,right)
 
-	raise ValueError()
-
-def random_binary_tree(n, leaf="X"):
-	"""
-	Return a random binary tree on n nodes drawn uniformly.
-	"""
-	if n ==1:
-		return leaf
-	if n == 2:
-		return (leaf,leaf)
-	catalan_nums = {}
-	cn = catalan_numbers(n-1,catalan_nums)
-	random_number = random.randint(0,cn-1)
-	for left_tree_size in range(1,n):
-		## is it a decomposition into
-		right_tree_size = n - left_tree_size 
-		random_number -= catalan_nums[left_tree_size - 1] * catalan_nums[right_tree_size - 1]
-		if random_number < 0:
-			left = random_binary_tree(left_tree_size,leaf)
-			right = random_binary_tree(right_tree_size,leaf)
-			return (left,right)
 	raise ValueError()
 
 def catalan_numbers(n, cache = {}):

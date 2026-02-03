@@ -10,7 +10,12 @@ from collections import defaultdict
 from collections import Counter
 import collections
 import utility
-from utility import *
+from utility import (
+	ParseFailureException,
+	DivergentWCFGException,
+	collect_yield,
+	strongly_connected_components,
+)
 # import warnings
 # warnings.filterwarnings("error")
 

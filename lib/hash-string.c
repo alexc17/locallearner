@@ -26,9 +26,14 @@ size_t strhash(const char *s)
 char *mystrsave(const char *s)    /* make a duplicate of s; see p 143 */
 {
   char *p;
-  
-  p = (char *) MALLOC(strlen(s)+1);	/* +1 for '\0' */
-  strcpy(p, s);
+  size_t len = strlen(s) + 1;  /* +1 for '\0' */
+
+  p = (char *) MALLOC(len);
+  if (p == NULL) {
+    fprintf(stderr, "mystrsave: memory allocation failed\n");
+    abort();
+  }
+  memcpy(p, s, len);
   return p;
 }
 

@@ -43,10 +43,15 @@ chart_make(size_t n)
 {
   size_t  i, nn = CHART_SIZE(n);
   chart   c = MALLOC(nn*sizeof(sihashf));
-  
-  for (i=0; i<nn; i++) 
-    c[i] = NULL;	/* chart cell will be constructed in apply_unary() */ 
-  
+
+  if (c == NULL) {
+    fprintf(stderr, "chart_make: memory allocation failed\n");
+    abort();
+  }
+
+  for (i=0; i<nn; i++)
+    c[i] = NULL;	/* chart cell will be constructed in apply_unary() */
+
   return c;
 }
 
@@ -272,9 +277,13 @@ binary_outside(const grammar g, size_t left_pos, size_t right_pos,
     return;
 
   completes = MALLOC((g->nnts+1)*sizeof(FLOAT));
+  if (completes == NULL) {
+    fprintf(stderr, "binary_outside: memory allocation failed\n");
+    abort();
+  }
   { size_t child_cat;
     for (child_cat=1; child_cat<=g->nnts; child_cat++)
-      completes[child_cat] = 0.0;   
+      completes[child_cat] = 0.0;
   } 
 
   /* try to combine with cells on left */
@@ -594,6 +603,11 @@ set_rule_weights(grammar g, FLOAT *rule_counts, int VariationalBayes)
 {
   FLOAT *parent_sum = MALLOC((g->nnts+1)*sizeof(FLOAT));
   size_t i;
+
+  if (parent_sum == NULL) {
+    fprintf(stderr, "set_rule_weights: memory allocation failed\n");
+    abort();
+  }
 
   for (i=0; i<=g->nnts; i++)
     parent_sum[i] = 0.0;

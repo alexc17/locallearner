@@ -63,7 +63,7 @@ def countOfCountsTable(counts, sparse=True):
 	if sparse == True:
 		cs = counts.values()
 	else:
-		cs = xrange(1, max(counts.values())+1)
+		cs = range(1, max(counts.values())+1)
 
 	countsOfCounts = {}
 	for c in cs:

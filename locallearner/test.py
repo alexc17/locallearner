@@ -54,14 +54,14 @@ def countOfCountsTable(counts, sparse=True):
     returned dictionary.
     """
     if sparse == True:
-        cs = counts.itervalues()
+        cs = counts.values()
     else:
-        cs = xrange(1, max(counts.itervalues())+1)
+        cs = range(1, max(counts.values())+1)
 
     countsOfCounts = {}
     for c in cs:
         countsOfCounts[c] = 0
-        for species, speciesCount in counts.iteritems():
+        for species, speciesCount in counts.items():
             if speciesCount == c:
                 countsOfCounts[c] += 1
 
@@ -84,10 +84,10 @@ def simpleGoodTuringProbs(counts, confidenceLevel=1.96):
     totalCounts = float(sum(counts.values()))   # N (G&S)
     countsOfCounts = countOfCountsTable(counts) # r -> n (G&S)
     sortedCounts = sorted(countsOfCounts.keys())
-    assert(totalCounts == sum([r*n for r,n in countsOfCounts.iteritems()]))
+    assert(totalCounts == sum([r*n for r,n in countsOfCounts.items()]))
 
     p0 = countsOfCounts[1] / totalCounts
-    print 'p0 = %f' % p0
+    print('p0 = %f' % p0)
 
     Z = __sgtZ(sortedCounts, countsOfCounts)
 
@@ -108,8 +108,8 @@ def simpleGoodTuringProbs(counts, confidenceLevel=1.96):
         # with count r+1.
         if r+1 not in countsOfCounts:
             if not useY:
-                print 'Warning: reached unobserved count before crossing the '\
-                      'smoothing threshold.'
+                print('Warning: reached unobserved count before crossing the '
+                      'smoothing threshold.')
             useY = True
 
         if useY:
@@ -142,9 +142,9 @@ def simpleGoodTuringProbs(counts, confidenceLevel=1.96):
     # estimated probability mass of unseen species.
     sgtProbs = {}
     smoothTot = 0.0
-    for r, rSmooth in rSmoothed.iteritems():
+    for r, rSmooth in rSmoothed.items():
         smoothTot += countsOfCounts[r] * rSmooth
-    for species, spCount in counts.iteritems():
+    for species, spCount in counts.items():
         sgtProbs[species] = (1.0 - p0) * (rSmoothed[spCount] / smoothTot)
 
     return sgtProbs, p0
@@ -169,9 +169,9 @@ def __sgtZ(sortedCounts, countsOfCounts):
 def __loglinregression(rs, zs):
     coef = linalg.lstsq(c_[log(rs), (1,)*len(rs)], log(zs))[0]
     a, b = coef
-    print 'Regression: log(z) = %f*log(r) + %f' % (a,b)
+    print('Regression: log(z) = %f*log(r) + %f' % (a,b))
     if a > -1.0:
-        print 'Warning: slope is > -1.0'
+        print('Warning: slope is > -1.0')
     return a, b
 
 
@@ -199,7 +199,7 @@ def plotFreqVsGoodTuring(counts, confidence=1.96, loglog=False):
     from matplotlib import rc
 
     tot = float(sum(counts.values()))
-    freqs = dict([(species, cnt/tot) for species, cnt in counts.iteritems()])
+    freqs = dict([(species, cnt/tot) for species, cnt in counts.items()])
     sgt, p0 = simpleGoodTuringProbs(counts, confidence)
 
     if loglog:
