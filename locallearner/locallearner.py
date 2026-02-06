@@ -63,7 +63,11 @@ class LocalLearner:
 		# Set hyperparameters here.
 		# Random seed used for the Ney Essen clustering.
 		self.seed = None
+		# Number of nonterminals. Set to 0 or None for automatic detection
+		# using the SSF-corrected distance threshold.
 		self.nonterminals = 2
+		self.min_nonterminals = 2
+		self.max_nonterminals = 20
 		self.min_count_nmf = 100
 		self.number_clusters = 10
 		self.em_max_length = 10
@@ -74,6 +78,9 @@ class LocalLearner:
 		## These are the local distributional features (+1 because of the sentence boundary.)
 		self.renyi = 5
 		self.posterior_threshold= 0.9
+		## Small sample factor: penalises rare words during NMF anchor selection.
+		## Subtracts ssf/sqrt(n) from distance scores to correct for sampling noise.
+		self.ssf = 1.0
 
 
 	def find_kernels(self,verbose=True):
@@ -296,7 +303,7 @@ class LocalLearner:
 			fwords.append(w)
 		fidx.append(self.alphabet_size)
 		fwords.append(self.start_symbol)
-		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=0)
+		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=self.ssf)
 		## This may not be the start symbol of the grammar.
 
 		start_idx = len(fidx)-1
@@ -318,21 +325,41 @@ class LocalLearner:
 				fwords.append(w)
 		fidx.append(self.alphabet_size)
 		fwords.append(self.start_symbol)
-		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=0)
+		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=self.ssf)
 		## This may not be the start symbol of the grammar.
 
 		start_idx = len(fidx)-1
 		self.nmf.start(start_idx)
-		## What does this even mean then?
 		self.kernels = [self.start_symbol]
 		assert not self.start_symbol in self.word2idx
 		self.nmf.excluded.add(start_idx)
-		while len(self.kernels) < self.nonterminals:
-			a, ai = self.nmf.find_but_dont_add()
+
+		auto_mode = not self.nonterminals
+		if auto_mode:
+			max_nt = self.max_nonterminals
+			min_nt = self.min_nonterminals
+		else:
+			max_nt = self.nonterminals
+			min_nt = self.nonterminals
+
+		while len(self.kernels) < max_nt:
+			a, ai, d = self.nmf.find_but_dont_add()
+			if a is None:
+				print("No more candidates.")
+				break
+			if auto_mode and len(self.kernels) >= min_nt and d <= 0:
+				print(f"Stopping: SSF-corrected distance {d:.6f} <= 0 "
+					  f"with {len(self.kernels)} nonterminals.")
+				break
 			if verbose:
-				print("Adding kernel", a, "count", self.lexical_counts[a])
+				print(f"Adding kernel {a}, count={self.lexical_counts[a]}, "
+					  f"distance={d:.6f}")
 			self.nmf.add_basis(ai)
 			self.kernels.append(a)
+
+		if auto_mode:
+			self.nonterminals = len(self.kernels)
+			print(f"Auto-detected {self.nonterminals} nonterminals.")
 		self.nmf.initialise_frank_wolfe()
 
 

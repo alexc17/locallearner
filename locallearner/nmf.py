@@ -14,11 +14,9 @@ epsilon = 1e-5
 
 class NMF:
 
-	def __init__(self, data, index, ssf = 1.0):
+	def __init__(self, data, index, ssf = 1.0, shrinkage=True):
 		## Matrix of (ndata, nfeatures) 
 		# all nonnegative, count data,.
-		# print(data)
-		# print(idx)
 		self.data = data.copy()
 		self.ssf= ssf
 		## Index is a list of n elements.
@@ -26,10 +24,26 @@ class NMF:
 		self.n = data.shape[0]
 		self.f = data.shape[1]
 		self.counts = np.zeros(self.n)
+
+		# Compute global distribution from raw counts (before normalization).
+		# This is the count-weighted mean of all word distributions.
+		p_global = np.sum(self.data, axis=0)
+		total = np.sum(p_global)
+		if total > 0:
+			p_global = p_global / total
+		self.p_global = p_global
+
 		for i in range(self.n):
 			self.counts[i] = np.sum(self.data[i,:])
 			self.data[i,:] = self.data[i,:]/ self.counts[i]
 
+		# Apply shrinkage: blend each word's distribution toward the global mean.
+		# Uses a Dirichlet-style prior with effective sample size = number of features.
+		# lambda_i = f / (f + n_i): heavy shrinkage for rare words, negligible for frequent ones.
+		if shrinkage:
+			for i in range(self.n):
+				lam = self.f / (self.f + self.counts[i])
+				self.data[i,:] = (1 - lam) * self.data[i,:] + lam * p_global
 
 		# list of indices
 		self.bases = None
@@ -57,8 +71,12 @@ class NMF:
 		"""
 		Maximum L2 norm, with L1 norm == 1,
 		will give us the most peaked vector.
+		Subtract a noise correction so rare words don't win by sampling variance alone.
 		"""
-		i = np.argmax(np.linalg.norm(self.data,axis=1))
+		norms = np.linalg.norm(self.data, axis=1)
+		corrections = np.array([self.small_sample_factor(self.counts[j]) for j in range(self.n)])
+		scores = norms - corrections
+		i = np.argmax(scores)
 		self.start(i)
 		return self.index[i]
 
@@ -148,9 +166,9 @@ class NMF:
 		a,d = self.find_furthest()
 		if a == None:
 			print(a,d,"NONE")
-			return None,None
+			return None,None,d
 		else:
-			return self.index[a],a
+			return self.index[a],a,d
 			
 
 	def remove_last_element(self):

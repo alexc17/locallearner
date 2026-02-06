@@ -10,6 +10,9 @@ srcdir = ../locallearner
 
 maxlength = 10
 evallength = 20
+sgd_epochs = 10
+sgd_lr = 0.1
+sgd_batchsize = 10000
 
 #suffixes = json kjson strings trees wcfg 0pcfg 1pcfg 
 
@@ -21,6 +24,7 @@ evallength = 20
 # .mlpcfg : ML grammar reestimated from the trees
 # .kernels : json file with the kernels in
 # .kjson : evaluation of kernels.
+# .sgd_pcfg : grammar trained with SGD (exponentiated gradient via IO)
 
 
 
@@ -73,7 +77,10 @@ evallength = 20
 %.0pcfg : %.wcfg
 	python ${srcdir}/convert_wcfg_to_pcfg.py $<  $@ >> $*.log
 
-%.json :  %.mlpcfg %.0pcfg %.1pcfg %.final_pcfg
+%.sgd_pcfg : %.0pcfg %.strings
+	python ${srcdir}/run_sgd_io.py --io ../bin/io --maxlength $(maxlength) --epochs $(sgd_epochs) --lr $(sgd_lr) --batchsize $(sgd_batchsize) --shuffle $< $*.strings $@ >> $*.log 2>&1
+
+%.json :  %.mlpcfg %.0pcfg %.1pcfg %.final_pcfg %.sgd_pcfg
 	python ${srcdir}/evaluate_pcfg.py --maxlength $(evallength)  --json $@  --target $*.pcfg $^  >> $*.log
 
 
@@ -82,7 +89,7 @@ json : $(json_files)
 # allkernels : $(kernel_files)
 
 clean : 
-	rm -f $(datadirs)/*.{log,json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg,final_pcfg,final_mjio,mlpcfg,0mjio,1mjio}
+	rm -f $(datadirs)/*.{log,json,kjson,strings,trees,wcfg,kernels,0pcfg,1pcfg,final_pcfg,final_mjio,mlpcfg,0mjio,1mjio,sgd_pcfg}
 
 thin :
 	rm -f $(datadirs)/*.{strings,trees,final_mjio,0mjio,1mjio}	 

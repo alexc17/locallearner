@@ -14,7 +14,8 @@ parser.add_argument('output', type=str, help='filename of output grammar')
 
 parser.add_argument('--skipio',action="store_true",  help="Skip the IO renormalisation.")
 
-parser.add_argument('--nonterminals', type=int, default= 3,  help="Number of nonterminals to be used.")
+parser.add_argument('--nonterminals', type=int, default= 0,  help="Number of nonterminals (0 = auto-detect, default 0).")
+parser.add_argument('--max_nonterminals', type=int, default= 20,  help="Maximum nonterminals for auto-detection (default 20).")
 parser.add_argument('--seed', type=int, default=None, help='Random seed for initialisation of clustering. (default None)')
 parser.add_argument('--io_max_samples', type=int, default= 100000,  help="Number of samples to be used for the IO training. (default 10e5)")
 parser.add_argument('--io_max_length', type=int, default= 10,  help="Maximum length of strings fo IO Reestimation, (default 10)")
@@ -29,6 +30,7 @@ args = parser.parse_args()
 
 ll = locallearner.LocalLearner(args.input)
 ll.nonterminals = args.nonterminals
+ll.max_nonterminals = args.max_nonterminals
 ll.seed = args.seed
 ll.em_max_samples = args.io_max_samples
 ll.em_max_length = args.io_max_length

@@ -14,8 +14,9 @@ parser = argparse.ArgumentParser(description='Run a quick learner on a single co
 parser.add_argument('input', type=str, help='filename of input corpus')
 parser.add_argument('output', type=str, help='filename of output kernel json file.')
 
-parser.add_argument('--nonterminals', type=int, default= 3,  help="Number of nonterminals to be used.")
-parser.add_argument('--cheat',   help="Filename of target grammar to be used for setting onumber of nonterminals only..")
+parser.add_argument('--nonterminals', type=int, default= 0,  help="Number of nonterminals (0 = auto-detect, default 0).")
+parser.add_argument('--max_nonterminals', type=int, default= 20,  help="Maximum nonterminals for auto-detection (default 20).")
+parser.add_argument('--cheat',   help="Filename of target grammar to be used for setting number of nonterminals only.")
 
 parser.add_argument('--seed', type=int, default=None, help='Random seed for initialisation of clustering. (default None)')
 parser.add_argument('--number_clusters', type=int, default= 10,  help="Number of clusters for neyessen, (default 10)")
@@ -29,12 +30,11 @@ ll = locallearner.LocalLearner(args.input)
 if args.cheat:
 	target_pcfg = wcfg.load_wcfg_from_file(args.cheat)
 	n = len(target_pcfg.nonterminals)
-	print(f"Number of nonterminals {n}")
+	print(f"Number of nonterminals {n} (from target grammar)")
 	ll.nonterminals = n
-
 else:
 	ll.nonterminals = args.nonterminals
-
+	ll.max_nonterminals = args.max_nonterminals
 
 ll.seed = args.seed
 ll.number_clusters = args.number_clusters

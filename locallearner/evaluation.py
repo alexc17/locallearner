@@ -87,7 +87,7 @@ def evaluate_kernel(target_pcfg, kernels):
 	Check the kernels against the target to see how well they match.
 	Return a number between 0 and 1.
 	"""
-	if len(kernels != len(target_pcfg.nonterminals)):
+	if len(kernels) != len(target_pcfg.nonterminals):
 		return 0.0
 	nts = set()
 	product = 1.0
@@ -101,6 +101,215 @@ def evaluate_kernel(target_pcfg, kernels):
 		return 0.0
 	else:
 		return product
+
+
+def evaluate_kernels_hungarian(target_pcfg, kernels):
+	"""
+	Evaluate kernels against the target grammar using optimal assignment.
+
+	Uses the Hungarian algorithm to find the best bijection from non-start
+	kernels to non-start nonterminals, maximizing total posterior P(NT | kernel_word).
+	The start kernel (kernels[0]) is evaluated separately: if it is a terminal
+	in the grammar, its posterior for the start nonterminal is computed;
+	otherwise it is treated as a structural symbol that maps to the start NT
+	by convention.
+
+	Args:
+		target_pcfg: the target PCFG
+		kernels: list of kernel words, kernels[0] is the start kernel,
+				 kernels[1:] are anchors for non-start nonterminals
+
+	Returns:
+		dict with:
+		  'accuracy': fraction of all kernels correctly assigned
+		  'mean_posterior': mean P(NT | kernel) under optimal assignment
+		  'min_posterior': minimum posterior (worst kernel)
+		  'product': product of posteriors
+		  'injective': True if optimal assignment maps to distinct NTs
+		  'n_kernels': total number of kernels (including start)
+		  'n_nonterminals': number of nonterminals in target
+		  'start_correct': whether the start kernel maps to the start NT
+		  'per_kernel': dict mapping each kernel word to
+					    {'assigned_nt', 'posterior', 'greedy_nt', 'correct', ...}
+		  'assignment': dict mapping kernel words to assigned nonterminals
+	"""
+	te = target_pcfg.terminal_expectations()
+	pe = target_pcfg.production_expectations()
+	nte = target_pcfg.nonterminal_expectations()
+
+	# Evaluate the start kernel
+	start_kernel = kernels[0]
+	start_nt = target_pcfg.start
+
+	if start_kernel in te and te[start_kernel] > 0:
+		# Start kernel is a terminal — compute its posterior for the start NT
+		start_posterior = pe.get((start_nt, start_kernel), 0.0) / te[start_kernel]
+		# Check which NT it actually best matches
+		best_nt_for_start = None
+		best_post_for_start = -1
+		for nt in target_pcfg.nonterminals:
+			p = pe.get((nt, start_kernel), 0.0) / te[start_kernel]
+			if p > best_post_for_start:
+				best_post_for_start = p
+				best_nt_for_start = nt
+		start_correct = (best_nt_for_start == start_nt)
+		start_greedy = best_nt_for_start
+	else:
+		# Start kernel is an abstract symbol (e.g. 'S') — correct by convention
+		start_posterior = 1.0
+		start_correct = True
+		start_greedy = start_nt
+
+	start_info = {
+		'assigned_nt': start_nt,
+		'posterior': start_posterior,
+		'greedy_nt': start_greedy,
+		'correct': start_correct,
+		'frequency': te.get(start_kernel, 0.0),
+		'nt_expectation': nte.get(start_nt, 0.0),
+	}
+
+	# Non-start kernels and nonterminals
+	kernel_words = kernels[1:]
+	non_start_nts = [nt for nt in target_pcfg.nonterminals
+					 if nt != start_nt]
+	nk = len(kernel_words)
+	nn = len(non_start_nts)
+	total_kernels = len(kernels)
+	total_nts = len(target_pcfg.nonterminals)
+
+	result = {
+		'n_kernels': total_kernels,
+		'n_nonterminals': total_nts,
+		'start_correct': start_correct,
+	}
+
+	if nk == 0:
+		result.update({
+			'accuracy': 1.0 if start_correct else 0.0,
+			'mean_posterior': start_posterior,
+			'min_posterior': start_posterior,
+			'product': start_posterior,
+			'injective': True,
+			'coverage': 1.0 / total_nts if total_nts > 0 else 0.0,
+			'per_kernel': {start_kernel: start_info},
+			'assignment': {start_kernel: start_nt},
+		})
+		return result
+
+	# Build the posterior matrix: posterior[i, j] = P(nt_j | kernel_i)
+	# P(NT | a) = E[count(NT -> a)] / E[count(a)]
+	#           = production_expectation(NT, a) / terminal_expectation(a)
+	dim = max(nk, nn)  # pad to square for Hungarian algorithm
+	posterior_matrix = np.zeros((dim, dim))
+
+	for i, a in enumerate(kernel_words):
+		ea = te.get(a, 0.0)
+		if ea <= 0:
+			continue
+		for j, nt in enumerate(non_start_nts):
+			posterior_matrix[i, j] = pe.get((nt, a), 0.0) / ea
+
+	# Hungarian algorithm: minimize cost, so negate posteriors
+	cost_matrix = -posterior_matrix
+	row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+	# Extract assignment (only for actual kernels and nonterminals)
+	assignment = {start_kernel: start_nt}
+	all_posteriors = [start_posterior]
+	per_kernel = {start_kernel: start_info}
+
+	# Also compute greedy (1-best) assignment for comparison
+	greedy = {}
+	for i, a in enumerate(kernel_words):
+		ea = te.get(a, 0.0)
+		if ea > 0:
+			best_nt = None
+			best_post = -1
+			for nt in non_start_nts:
+				p = pe.get((nt, a), 0.0) / ea
+				if p > best_post:
+					best_post = p
+					best_nt = nt
+			greedy[a] = best_nt
+		else:
+			greedy[a] = None
+
+	for i, j in zip(row_ind, col_ind):
+		if i < nk and j < nn:
+			a = kernel_words[i]
+			nt = non_start_nts[j]
+			post = posterior_matrix[i, j]
+			assignment[a] = nt
+			all_posteriors.append(post)
+			per_kernel[a] = {
+				'assigned_nt': nt,
+				'posterior': post,
+				'greedy_nt': greedy.get(a),
+				'correct': (nt == greedy.get(a)),
+				'frequency': te.get(a, 0.0),
+				'nt_expectation': nte.get(nt, 0.0),
+			}
+
+	# Handle kernels that didn't get assigned (if nk > nn)
+	assigned_indices = set(row_ind[row_ind < nk])
+	for i, a in enumerate(kernel_words):
+		if i not in assigned_indices:
+			per_kernel[a] = {
+				'assigned_nt': None,
+				'posterior': 0.0,
+				'greedy_nt': greedy.get(a),
+				'correct': False,
+				'frequency': te.get(a, 0.0),
+				'nt_expectation': 0.0,
+			}
+			all_posteriors.append(0.0)
+
+	# Compute metrics (including start kernel)
+	assigned_nts = [v for v in assignment.values() if v is not None]
+	injective = len(assigned_nts) == len(set(assigned_nts))
+
+	# Accuracy: fraction of all kernels correctly assigned
+	n_correct = sum(1 for a in per_kernel
+					if per_kernel[a]['correct'])
+	accuracy = n_correct / total_kernels if total_kernels > 0 else 0.0
+
+	mean_post = float(np.mean(all_posteriors)) if all_posteriors else 0.0
+	min_post = min(all_posteriors) if all_posteriors else 0.0
+	product = 1.0
+	for p in all_posteriors:
+		product *= p
+
+	# Nonterminal coverage: fraction of target NTs that have a kernel
+	covered_nts = set(assignment.values()) - {None}
+	coverage = len(covered_nts) / total_nts if total_nts > 0 else 0.0
+
+	# Weighted accuracy: weight each kernel by its nonterminal's
+	# expected usage in the target grammar
+	total_weight = 0.0
+	weighted_correct = 0.0
+	for a in per_kernel:
+		info = per_kernel[a]
+		nt = info.get('greedy_nt')
+		w = nte.get(nt, 1.0) if nt else 1.0
+		total_weight += w
+		if info['correct']:
+			weighted_correct += w
+	weighted_accuracy = weighted_correct / total_weight if total_weight > 0 else 0.0
+
+	result.update({
+		'accuracy': accuracy,
+		'weighted_accuracy': weighted_accuracy,
+		'mean_posterior': mean_post,
+		'min_posterior': min_post,
+		'product': product,
+		'injective': injective,
+		'coverage': coverage,
+		'per_kernel': per_kernel,
+		'assignment': assignment,
+	})
+
+	return result
 
 def estimate_bijection(target_pcfg, hypothesis_pcfg, samples = 1000, seed=None, max_length=math.inf,verbose=False):
 	## Essential assumption
@@ -546,4 +755,59 @@ def conditional_kld(target, hypothesis, samples = 1000,verbose=False, max_length
 		total += (ptree - qtree) - (pstring - qstring)
 		if verbose:
 			print("%s p(t) = %f, p(w) = %f, q(t) = %f, q(w) = %f" % ( s, ptree,pstring,qtree,qstring))
-	return total/n	
+	return total/n
+
+
+def string_kld_neural(target_pcfg, neural_model, samples=1000, max_length=20, seed=None, verbose=False):
+	"""
+	Compute string KLD between a target PCFG and a neural language model.
+
+	Uses Monte Carlo estimation by sampling from the target PCFG and computing
+	the difference in log probabilities.
+
+	Args:
+		target_pcfg: Target PCFG to sample from
+		neural_model: Neural language model with log_probability(sentence) method
+		samples: Number of samples for Monte Carlo estimate
+		max_length: Maximum string length to consider
+		seed: Random seed for reproducibility
+		verbose: Print sample-level information
+
+	Returns:
+		Estimated KLD D(target || neural) = E_target[log P_target(s) - log P_neural(s)]
+	"""
+	if seed is None:
+		rng = numpy.random.RandomState()
+	else:
+		rng = numpy.random.RandomState(seed)
+
+	inside_target = wcfg.InsideComputation(target_pcfg)
+	sampler = wcfg.Sampler(target_pcfg, random=rng)
+
+	total = 0.0
+	n = 0
+
+	for i in range(samples):
+		t = sampler.sample_tree()
+		s = utility.collect_yield(t)
+
+		if len(s) > max_length:
+			continue
+
+		n += 1
+
+		# Target log probability
+		lp_target = inside_target.inside_log_probability(s)
+
+		# Neural model log probability
+		lp_neural = neural_model.log_probability(s)
+
+		if verbose:
+			print(f"Sample {i}: {s}, target={lp_target:.4f}, neural={lp_neural:.4f}")
+
+		total += lp_target - lp_neural
+
+	if n == 0:
+		raise ValueError("No valid samples collected (all exceeded max_length)")
+
+	return total / n
