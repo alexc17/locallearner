@@ -44,17 +44,22 @@ class LocalLearner:
 		self.max_length = 0
 		self.sentences = []
 		with open(filename) as inf:
-			for line in inf:
+			for lineno, line in enumerate(inf, 1):
 				if line[0] == '#':
 					continue
 				s = line.split()
 				l = len(s)
 				if l > 0:
+					for w in s:
+						if not w[0].islower():
+							raise ValueError(
+								f"Token '{w}' on line {lineno} does not "
+								f"start with a lowercase letter. "
+								f"Is this a corpus file (.strings/.yld)?")
+						self.lexical_counts[w] += 1
 					self.number_samples += 1
 					self.number_tokens += l
 					self.max_length = max(l,self.max_length)
-					for w in s:
-						self.lexical_counts[w] += 1
 					self.sentences.append(tuple(s))
 		self.alphabet_size = len(self.lexical_counts)
 		self.idx2word = list(self.lexical_counts)
@@ -81,6 +86,11 @@ class LocalLearner:
 		## Small sample factor: penalises rare words during NMF anchor selection.
 		## Subtracts ssf/sqrt(n) from distance scores to correct for sampling noise.
 		self.ssf = 1.0
+		## Significance threshold for NMF auto-stopping.
+		## The survival probability of the best candidate under a scaled
+		## chi-squared null model must be below this to add a new kernel.
+		## Lower values = more conservative (fewer nonterminals).
+		self.nmf_significance = 0.001
 
 
 	def find_kernels(self,verbose=True):
@@ -304,9 +314,11 @@ class LocalLearner:
 		fidx.append(self.alphabet_size)
 		fwords.append(self.start_symbol)
 		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=self.ssf)
-		## This may not be the start symbol of the grammar.
 
+		# The start vector is artificial (not estimated from data), so shrinkage
+		# destroys it by blending it ~92% toward the global mean. Restore it.
 		start_idx = len(fidx)-1
+		self.nmf.data[start_idx,:] = self.start_vector / np.sum(self.start_vector)
 		self.nmf.start(start_idx)
 		self.kernels = [ kernels[0] ]
 		for a in kernels[1:]:
@@ -326,9 +338,11 @@ class LocalLearner:
 		fidx.append(self.alphabet_size)
 		fwords.append(self.start_symbol)
 		self.nmf = nmf.NMF(self.unigram_features[fidx,:], fwords, ssf=self.ssf)
-		## This may not be the start symbol of the grammar.
 
+		# The start vector is artificial (not estimated from data), so shrinkage
+		# destroys it by blending it ~92% toward the global mean. Restore it.
 		start_idx = len(fidx)-1
+		self.nmf.data[start_idx,:] = self.start_vector / np.sum(self.start_vector)
 		self.nmf.start(start_idx)
 		self.kernels = [self.start_symbol]
 		assert not self.start_symbol in self.word2idx
@@ -347,10 +361,22 @@ class LocalLearner:
 			if a is None:
 				print("No more candidates.")
 				break
-			if auto_mode and len(self.kernels) >= min_nt and d <= 0:
-				print(f"Stopping: SSF-corrected distance {d:.6f} <= 0 "
-					  f"with {len(self.kernels)} nonterminals.")
-				break
+
+			# In auto mode, test whether the candidate is a significant
+			# outlier using the scaled chi-squared model.
+			if auto_mode and len(self.kernels) >= min_nt:
+				sig = self.nmf.candidate_significance(ai)
+				if verbose:
+					print(f"  candidate {a}: survival_prob={sig['survival_prob']:.2e}, "
+						  f"ratio={sig['ratio']:.1f}, "
+						  f"scaled_stat={sig['scaled_stat']:.1f}, "
+						  f"null_max={sig['expected_null_max']:.1f}")
+				if sig['survival_prob'] > self.nmf_significance:
+					print(f"Stopping: candidate {a} not significant "
+						  f"(p={sig['survival_prob']:.4f} > {self.nmf_significance}) "
+						  f"with {len(self.kernels)} nonterminals.")
+					break
+
 			if verbose:
 				print(f"Adding kernel {a}, count={self.lexical_counts[a]}, "
 					  f"distance={d:.6f}")

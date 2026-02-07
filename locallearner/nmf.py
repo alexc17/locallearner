@@ -6,6 +6,7 @@
 import numpy as np
 import numpy.linalg 
 import scipy.spatial.distance
+from scipy.stats import chi2
 import math
 import logging
 
@@ -124,7 +125,7 @@ class NMF:
 
 
 
-	def find_furthest(self,verbose=True):
+	def find_furthest(self,verbose=False):
 		largestd = -1
 		furthest = None
 
@@ -134,11 +135,12 @@ class NMF:
 				d = self.distances[i]
 				d -= self.small_sample_factor(n)
 				if verbose:
-					print(self.index[i], d,n)
+					print(self.index[i], d, n)
 				if d > largestd:
 					largestd = d
 					furthest = i
-		print("Largest d ", largestd)
+		if verbose:
+			print("Largest d ", largestd)
 		return furthest, largestd
 
 
@@ -164,11 +166,115 @@ class NMF:
 
 	def find_but_dont_add(self):
 		a,d = self.find_furthest()
-		if a == None:
-			print(a,d,"NONE")
-			return None,None,d
+		if a is None:
+			return None, None, d
 		else:
-			return self.index[a],a,d
+			return self.index[a], a, d
+
+	def candidate_significance(self, candidate_idx):
+		"""
+		Test whether the candidate word's distance from the current basis
+		hyperplane is significantly larger than expected under the null
+		hypothesis that all remaining variation is noise.
+
+		Uses a scaled chi-squared model: for each word i, the normalised
+		test statistic T_i = n_i * d_i^2 / (1 - ||p_i||_2^2) should be
+		approximately scale * chi2(df) under the null, where:
+		  - df = f - 1 - k  (features minus simplex constraint minus basis dim)
+		  - scale is estimated empirically from the median of all T_i
+
+		The candidate's scaled statistic is compared to the distribution of
+		the maximum of m independent chi2(df) draws.
+
+		Args:
+			candidate_idx: index into self.data of the candidate word
+
+		Returns:
+			dict with:
+			  'survival_prob': probability of seeing a value >= the candidate's
+			    scaled statistic as the max of m chi2(df) draws (i.e. the
+			    Bonferroni-corrected p-value). Small values = significant outlier.
+			  'scaled_stat': candidate's test statistic divided by noise scale
+			  'expected_null_max': expected maximum under the null
+			  'ratio': scaled_stat / expected_null_max (>>1 means real signal)
+			  'df': degrees of freedom
+			  'scale': estimated noise scale factor
+		"""
+		k = len(self.bases)
+		df = self.f - 1 - k
+		if df <= 0:
+			return {
+				'survival_prob': 1.0, 'scaled_stat': 0.0,
+				'expected_null_max': 0.0, 'ratio': 0.0,
+				'df': df, 'scale': 1.0,
+			}
+
+		# Compute normalised test statistics for all non-excluded words
+		test_stats = []
+		for i in range(self.n):
+			if i in self.excluded:
+				continue
+			d = self.distances[i]
+			n = self.counts[i]
+			l2_sq = np.dot(self.data[i,:], self.data[i,:])
+			if l2_sq < 1.0 and n > 0:
+				test_stats.append(n * d * d / (1 - l2_sq))
+
+		if len(test_stats) < 2:
+			return {
+				'survival_prob': 1.0, 'scaled_stat': 0.0,
+				'expected_null_max': 0.0, 'ratio': 0.0,
+				'df': df, 'scale': 1.0,
+			}
+
+		m = len(test_stats)
+
+		# Estimate noise scale from the median
+		empirical_median = np.median(test_stats)
+		chi2_med = chi2.median(df)
+		scale = empirical_median / chi2_med if chi2_med > 0 else 1.0
+
+		# Candidate's scaled statistic
+		d_c = self.distances[candidate_idx]
+		n_c = self.counts[candidate_idx]
+		l2_sq_c = np.dot(self.data[candidate_idx,:], self.data[candidate_idx,:])
+		if l2_sq_c >= 1.0 or n_c <= 0 or scale <= 0:
+			return {
+				'survival_prob': 1.0, 'scaled_stat': 0.0,
+				'expected_null_max': 0.0, 'ratio': 0.0,
+				'df': df, 'scale': scale,
+			}
+
+		t_candidate = n_c * d_c * d_c / (1 - l2_sq_c)
+		scaled_stat = t_candidate / scale
+
+		# Expected max of m chi2(df) draws:
+		# approx df + 2*sqrt(df * 2*log(m)) + 2*log(m)
+		expected_null_max = df + 2*math.sqrt(df * 2*math.log(m)) + 2*math.log(m)
+
+		ratio = scaled_stat / expected_null_max if expected_null_max > 0 else 0.0
+
+		# Survival probability: P(max of m chi2(df) >= scaled_stat)
+		# = 1 - P(all m < scaled_stat) = 1 - (1 - sf(scaled_stat))^m
+		single_p = chi2.sf(scaled_stat, df=df)
+		if single_p >= 1.0:
+			survival_prob = 1.0
+		elif single_p <= 0.0:
+			survival_prob = 0.0
+		elif m * single_p < 0.01:
+			# For small probabilities, use Bonferroni approximation
+			survival_prob = min(1.0, m * single_p)
+		else:
+			survival_prob = 1.0 - (1.0 - single_p) ** m
+
+		return {
+			'survival_prob': survival_prob,
+			'scaled_stat': scaled_stat,
+			'expected_null_max': expected_null_max,
+			'ratio': ratio,
+			'df': df,
+			'scale': scale,
+		}
 			
 
 	def remove_last_element(self):

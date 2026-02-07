@@ -10,7 +10,7 @@ srcdir = ../locallearner
 
 maxlength = 10
 evallength = 20
-sgd_epochs = 10
+sgd_epochs = 1
 sgd_lr = 0.1
 sgd_batchsize = 10000
 

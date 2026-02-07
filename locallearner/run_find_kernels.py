@@ -22,6 +22,7 @@ parser.add_argument('--seed', type=int, default=None, help='Random seed for init
 parser.add_argument('--number_clusters', type=int, default= 10,  help="Number of clusters for neyessen, (default 10)")
 parser.add_argument('--min_count_nmf', type=int, default= 100,  help="Minimum frequency of words that can be considered to be amchors for nonterminals.(default 100)")
 
+parser.add_argument('--significance', type=float, default=0.001, help="Significance threshold for auto-stopping (default 0.001).")
 parser.add_argument('--verbose', action="store_true", help="Print out some useful information")
 
 
@@ -39,6 +40,7 @@ else:
 ll.seed = args.seed
 ll.number_clusters = args.number_clusters
 ll.min_count_nmf = args.min_count_nmf
+ll.nmf_significance = args.significance
 
 kernels = ll.find_kernels(verbose=args.verbose)
 with open(args.output,'w') as outf:
