@@ -38,6 +38,11 @@ class NMF:
 			self.counts[i] = np.sum(self.data[i,:])
 			self.data[i,:] = self.data[i,:]/ self.counts[i]
 
+		# Store the raw (pre-shrinkage) normalized distributions.
+		# Used by min_kl_to_bases for distributional distinctness checks,
+		# since shrinkage compresses divergences between genuinely different kernels.
+		self.raw_data = self.data.copy()
+
 		# Apply shrinkage: blend each word's distribution toward the global mean.
 		# Uses a Dirichlet-style prior with effective sample size = number of features.
 		# lambda_i = f / (f + n_i): heavy shrinkage for rare words, negligible for frequent ones.
@@ -54,6 +59,9 @@ class NMF:
 		self.orthonormal = None
 		## ones that we don't consider.
 		self.excluded = set()
+		# When True, use Gram-Schmidt (hyperplane) distances for kernel
+		# selection instead of Frank-Wolfe (convex hull) distances.
+		self.use_gram_schmidt = False
 
 
 	def small_sample_factor(self, n):
@@ -144,10 +152,12 @@ class NMF:
 		return furthest, largestd
 
 
-	def add_basis(self, i, gram_schmidt=False):
+	def add_basis(self, i, gram_schmidt=None):
 		self.bases.append(i)
 		self.excluded.add(i)
 		self.M.append(self.data[i,:])
+		if gram_schmidt is None:
+			gram_schmidt = self.use_gram_schmidt
 		if gram_schmidt: 
 			self.gram_schmidt()
 		else:
@@ -276,6 +286,148 @@ class NMF:
 			'scale': scale,
 		}
 			
+
+	@staticmethod
+	def kl_divergence(p, q):
+		"""KL(p || q) = sum_i p_i log(p_i / q_i).
+
+		Returns inf if any p_i > 0 where q_i == 0.
+		"""
+		d = 0.0
+		for pi, qi in zip(p, q):
+			if pi > 1e-15:
+				if qi <= 1e-15:
+					return math.inf
+				d += pi * math.log(pi / qi)
+		return d
+
+	def min_kl_to_bases(self, candidate_idx):
+		"""Minimum KL(candidate || base_j) over all current basis words.
+
+		Uses the raw (pre-shrinkage) distributions so that the divergences
+		reflect the true distributional differences rather than being
+		compressed by shrinkage toward the global mean.
+
+		Measures how well the candidate's context distribution is
+		"covered" by the closest existing kernel.  For a genuine new
+		nonterminal anchor the minimum should be large; for a spurious
+		candidate that is a mixture of existing kernels it will be small.
+
+		Returns:
+			(min_kl, closest_base_index)
+		"""
+		p = self.raw_data[candidate_idx, :]
+		min_kl = math.inf
+		closest = None
+		for bi in self.bases:
+			kl = self.kl_divergence(p, self.raw_data[bi, :])
+			if kl < min_kl:
+				min_kl = kl
+				closest = bi
+		return min_kl, closest
+
+	def bootstrap_null_distance(self, candidate_idx, n_bootstrap=500, seed=None):
+		"""Bootstrap the null distribution of hyperplane distances.
+
+		Uses the candidate's FW decomposition as the null hypothesis,
+		accounting for sampling noise in BOTH the candidate AND the
+		existing kernel distributions.
+
+		For each bootstrap replicate:
+		  1. Resample each kernel's distribution from Multinomial(n_j, raw_j)
+		     to account for estimation noise in the basis vectors.
+		     (The start symbol at bases[0] is artificial and not resampled.)
+		  2. Re-shrink resampled kernels to form the bootstrap basis.
+		  3. Form the null mixture p = FW_weights @ resampled_raw_kernels.
+		  4. Sample candidate counts ~ Multinomial(n_cand, p_null).
+		  5. Normalize, shrink, and compute Gram-Schmidt distance from
+		     the hyperplane spanned by the resampled basis.
+
+		Args:
+			candidate_idx: index into self.data of the candidate word
+			n_bootstrap: number of bootstrap samples
+			seed: random seed for reproducibility
+
+		Returns:
+			(p_value, candidate_distance, bootstrap_distances)
+			p_value: fraction of bootstrap distances >= candidate's distance
+		"""
+		rng = np.random.RandomState(seed)
+		k = len(self.bases)
+		n_cand = int(self.counts[candidate_idx])
+		f = self.f
+
+		# Get the candidate's actual hyperplane distance
+		d_candidate = self.distances[candidate_idx]
+
+		# Get the candidate's FW decomposition for null mixture weights
+		self.initialise_frank_wolfe()
+		x_candidate, _ = self.estimate_frank_wolfe(
+			self.data[candidate_idx, :])
+
+		# Kernel info: counts and raw distributions
+		kernel_counts = np.array([int(self.counts[bi]) for bi in self.bases])
+		kernel_raw = np.array([self.raw_data[bi, :] for bi in self.bases])
+
+		bootstrap_distances = np.zeros(n_bootstrap)
+
+		for b in range(n_bootstrap):
+			# Step 1: Resample kernel distributions from their counts.
+			# bases[0] is the start symbol (artificial, fixed); skip it.
+			resampled_raw = kernel_raw.copy()
+			resampled_shrunk = np.zeros((k, f))
+
+			for j in range(k):
+				if j == 0:
+					# Start symbol: artificial, don't resample
+					resampled_shrunk[j] = self.data[self.bases[j], :]
+				else:
+					n_j = kernel_counts[j]
+					if n_j > 0:
+						counts_j = rng.multinomial(n_j, kernel_raw[j])
+						resampled_raw[j] = counts_j / n_j
+					# Apply shrinkage
+					lam_j = f / (f + n_j)
+					resampled_shrunk[j] = (
+						(1 - lam_j) * resampled_raw[j] + lam_j * self.p_global)
+
+			# Step 2: Form null mixture from resampled raw kernels
+			p_null = x_candidate @ resampled_raw
+			p_null = np.maximum(p_null, 0)
+			p_sum = np.sum(p_null)
+			if p_sum <= 0:
+				continue
+			p_null /= p_sum
+
+			# Step 3: Sample candidate counts from null mixture
+			counts_cand = rng.multinomial(n_cand, p_null)
+			total = np.sum(counts_cand)
+			if total == 0:
+				continue
+			dist_cand = counts_cand / total
+
+			# Apply shrinkage
+			lam_c = f / (f + total)
+			dist_shrunk = (1 - lam_c) * dist_cand + lam_c * self.p_global
+
+			# Step 4: Compute Gram-Schmidt distance to the hyperplane
+			# spanned by the resampled (shrunk) basis vectors.
+			ortho = []
+			for v in resampled_shrunk:
+				u = v.copy()
+				for o in ortho:
+					u = u - np.dot(u, o) * o
+				norm = np.linalg.norm(u)
+				if norm > 1e-10:
+					ortho.append(u / norm)
+
+			residual = dist_shrunk.copy()
+			for o in ortho:
+				residual = residual - np.dot(residual, o) * o
+			bootstrap_distances[b] = np.linalg.norm(residual)
+
+		p_value = float(np.mean(bootstrap_distances >= d_candidate))
+		return p_value, d_candidate, bootstrap_distances
 
 	def remove_last_element(self):
 		self.bases = self.bases[:-1]

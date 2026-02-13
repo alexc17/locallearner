@@ -317,5 +317,48 @@ class Clustering:
 				outf.write("%s %d \n" % (w,self.cluster_indices[i]))
 
 
+def save_cluster_dict(clusters, filename, n_clusters=None, seed=None):
+	"""Save a word->cluster_id dict to a .clusters file.
+
+	Format: one line per word, 'word cluster_id'.
+	First line is a header comment with metadata.
+	"""
+	with open(filename, 'w') as f:
+		f.write(f"# n_clusters={n_clusters} seed={seed}\n")
+		for word, cid in sorted(clusters.items()):
+			f.write(f"{word} {cid}\n")
+
+
+def load_cluster_dict(filename):
+	"""Load a word->cluster_id dict from a .clusters file.
+
+	Returns:
+		(clusters_dict, metadata_dict)
+		where clusters_dict maps word (str) -> cluster_id (int)
+		and metadata_dict has 'n_clusters' and 'seed' if present.
+	"""
+	clusters = {}
+	metadata = {}
+	with open(filename, 'r') as f:
+		for line in f:
+			line = line.strip()
+			if not line:
+				continue
+			if line.startswith('#'):
+				# Parse metadata from header
+				for part in line[1:].split():
+					if '=' in part:
+						k, v = part.split('=', 1)
+						try:
+							metadata[k] = int(v)
+						except ValueError:
+							metadata[k] = v
+				continue
+			parts = line.split()
+			if len(parts) >= 2:
+				word = parts[0]
+				cid = int(parts[1])
+				clusters[word] = cid
+	return clusters, metadata
 
 

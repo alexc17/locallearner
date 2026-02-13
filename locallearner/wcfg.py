@@ -387,7 +387,7 @@ class WCFG:
 
 	def estimate_bup_from_file(self, filename, maxlength, maxcount):
 		"""
-		Create a new botom up grammar with the binary parameters restimated from the 
+		Create a new bottom up grammar with the binary parameters restimated from the 
 		data.
 		"""
 		nlines = 0
@@ -440,9 +440,18 @@ class WCFG:
 		newone.trim_zeros()
 		return newone
 
-	def estimate_inside_outside_from_list(self, data, maxlength, maxcount, robust=True):
+	def estimate_inside_outside_from_list(self, data, maxlength, maxcount, robust=True, stepsize=1.0):
 		"""
-		Create a new one with parameters estimated from. 
+		Create a new grammar with parameters re-estimated via Inside-Outside.
+
+		When stepsize < 1.0, the new parameters are an interpolation
+		between the current parameters and the MLE from the mini-batch:
+		  new_param = (1 - stepsize) * old_param + stepsize * mle_param
+		This ensures that productions unseen in the mini-batch are
+		shrunk but not zeroed out.
+
+		When stepsize == 1.0 (default), this is standard batch EM:
+		the parameters are replaced entirely by the MLE from the data.
 		"""
 		nlines = 0
 		io = InsideComputation(self)
@@ -461,15 +470,36 @@ class WCFG:
 				nlines += 1
 			if nlines >= maxcount:
 				break
-		newone = self.copy()		
-		newone.parameters = posteriors
-		for prod in self.productions:
-			if not prod in newone.parameters:
-				## Eg a lexical rule which doesnt appear in the data.
-				newone.parameters[prod] = 0
-		newone.locally_normalise_lax()
-		newone.trim_zeros()
-		return newone
+
+		if stepsize >= 1.0:
+			# Standard batch EM: replace parameters with MLE
+			newone = self.copy()
+			newone.parameters = posteriors
+			for prod in self.productions:
+				if not prod in newone.parameters:
+					newone.parameters[prod] = 0
+			newone.locally_normalise_lax()
+			newone.trim_zeros()
+			return newone
+		else:
+			# Interpolate old parameters with mini-batch MLE.
+			# First locally normalise the posteriors.
+			totals = defaultdict(float)
+			for prod in self.productions:
+				totals[prod[0]] += posteriors.get(prod, 0.0)
+
+			newone = self.copy()
+			for prod in self.productions:
+				old_p = self.parameters[prod]
+				lhs_total = totals[prod[0]]
+				if lhs_total > 0:
+					mle_p = posteriors.get(prod, 0.0) / lhs_total
+				else:
+					mle_p = old_p
+				newone.parameters[prod] = (1 - stepsize) * old_p + stepsize * mle_p
+			newone.locally_normalise_lax()
+			newone.trim_zeros()
+			return newone
 
 
 	def estimate_string_density(self, length, nsamples):
@@ -1388,6 +1418,8 @@ class InsideComputation:
 		table, table2 = self._compute_inside_table(sentence,mode=1)
 		def extract_tree(start,lhs,end):
 			if end == start + 1:
+				if not (start,lhs,end) in table:
+					raise ParseFailureException()
 				return (lhs, sentence[start])
 			else:
 				if not (start,lhs,end) in table:

@@ -23,7 +23,8 @@ parser.add_argument('--number_clusters', type=int, default= 10,  help="Number of
 parser.add_argument('--min_count_nmf', type=int, default= 100,  help="Minimum frequency of words that can be considered to be amchors for nonterminals.(default 100)")
 parser.add_argument('--kernels',  help="save the kernels in a file for evaluation purposes.")
 parser.add_argument('--wcfg',  help="save the raw WCFG in a file for evaluation purposes.")
-parser.add_argument('--significance', type=float, default=0.001, help="Significance threshold for auto-stopping (default 0.001).")
+parser.add_argument('--ratio_threshold', type=float, default=10.0, help="Ratio threshold for NMF auto-stopping: candidate's scaled statistic must exceed the expected null maximum by this factor (default 10.0).")
+parser.add_argument('--min_divergence', type=float, default=0.1, help="Minimum KL divergence to nearest existing kernel for a candidate to be accepted (default 0.1).")
 parser.add_argument('--verbose', action="store_true", help="Print out some useful information")
 
 
@@ -37,7 +38,8 @@ ll.em_max_samples = args.io_max_samples
 ll.em_max_length = args.io_max_length
 ll.number_clusters = args.number_clusters
 ll.min_count_nmf = args.min_count_nmf
-ll.nmf_significance = args.significance
+ll.nmf_ratio_threshold = args.ratio_threshold
+ll.nmf_min_divergence = args.min_divergence
 if args.skipio:
 	ll.em_max_samples=1
 
