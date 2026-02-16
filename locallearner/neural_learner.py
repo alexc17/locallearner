@@ -26,7 +26,9 @@ import ngram_counts
 import nmf as nmf_module
 from neural_features import (
     ClozeModel, PairClozeModel, ClozeDataset, PairClozeDataset,
+    PositionalClozeModel, PositionalPairClozeModel,
     build_vocab, train_cloze_model, train_pair_cloze_model,
+    train_positional_cloze_model, train_positional_pair_cloze_model,
     save_model, load_model, load_sentences, save_kernels, load_kernels,
     BOUNDARY,
 )
@@ -89,6 +91,7 @@ class NeuralLearner:
         self.n_epochs = 10            # training epochs
         self.batch_size = 4096        # training batch size
         self.ssf = 1.0                # small sample factor for NMF
+        self.model_type = 'bow'       # 'bow' (bag-of-words) or 'positional'
 
         # Cache paths (set to enable caching)
         self.cluster_file = None
@@ -243,15 +246,20 @@ class NeuralLearner:
             return
 
         if verbose:
-            print(f"Training single cloze model (k={self.k}, "
+            mt = self.model_type
+            print(f"Training single cloze model ({mt}, k={self.k}, "
                   f"{self.n_epochs} epochs)...")
 
-        model, w2i, i2w, history = train_cloze_model(
+        train_fn = (train_positional_cloze_model if self.model_type == 'positional'
+                    else train_cloze_model)
+        model, w2i, i2w, history = train_fn(
             self.sentences, k=self.k,
             embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
             n_epochs=self.n_epochs, batch_size=self.batch_size,
             lr=1e-3, min_count=1, seed=self.seed, verbose=verbose,
         )
+        # Move to CPU for inference (training may use MPS/CUDA)
+        model = model.cpu()
         self.single_model = model
         self.w2i = w2i
         self.i2w = i2w
@@ -270,15 +278,20 @@ class NeuralLearner:
             return
 
         if verbose:
-            print(f"Training pair cloze model (k={self.k}, "
+            mt = self.model_type
+            print(f"Training pair cloze model ({mt}, k={self.k}, "
                   f"{self.n_epochs} epochs)...")
 
-        model, w2i, i2w, history = train_pair_cloze_model(
+        train_fn = (train_positional_pair_cloze_model if self.model_type == 'positional'
+                    else train_pair_cloze_model)
+        model, w2i, i2w, history = train_fn(
             self.sentences, k=self.k,
             embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
             n_epochs=self.n_epochs, batch_size=self.batch_size,
             lr=1e-3, min_count=1, seed=self.seed, verbose=verbose,
         )
+        # Move to CPU for inference (training may use MPS/CUDA)
+        model = model.cpu()
         self.pair_model = model
 
         # Ensure vocab is consistent
@@ -432,6 +445,257 @@ class NeuralLearner:
 
         return self.anchors
 
+    def select_anchors_minimal(self, tau_low=0.5, tau_high=1.5,
+                               max_terminals=500, verbose=True):
+        """Select anchors by finding terminals with minimal context
+        distributions, using asymmetric Rényi divergences.
+
+        Maintains an antichain of distributionally-minimal terminals.
+        A terminal a is "smaller" than b if D(a||b) < tau_low and
+        D(b||a) > tau_high, meaning a's context support is a subset
+        of b's.
+
+        Processes terminals in decreasing frequency order. The
+        antichain is initialised with a synthetic S terminal whose
+        context distribution is concentrated on the boundary-only
+        context.
+
+        Args:
+            tau_low:  threshold below which divergence indicates
+                      distribution inclusion.
+            tau_high: threshold above which divergence indicates
+                      the reverse direction is not included.
+            max_terminals: only consider the top-N most frequent
+                      terminals.
+            verbose:  print progress trace.
+
+        Returns:
+            list of anchor words (excluding S).
+        """
+        assert self.single_model is not None, "Train single model first"
+
+        k = self.k
+
+        # --- 1. Select terminals to consider, sorted by frequency ---
+        terminals = sorted(self.vocab, key=lambda w: -self.word_counts.get(w, 0))
+        terminals = [w for w in terminals if w in self.w2i][:max_terminals]
+
+        if verbose:
+            print(f"Selecting minimal-distribution anchors from "
+                  f"{len(terminals)} terminals (tau_low={tau_low}, "
+                  f"tau_high={tau_high})...")
+
+        # --- 2. Collect contexts for all terminals in one corpus pass ---
+        terminal_set = set(terminals)
+        terminal_ctxs = {w: Counter() for w in terminals}
+
+        for sent in self.sentences:
+            padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
+            for i in range(k, len(padded) - k):
+                w = padded[i]
+                if w in terminal_set:
+                    ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
+                    terminal_ctxs[w][ctx] += 1
+
+        # --- 3. Precompute neural log-probs per terminal ---
+        terminal_log_p = {}  # word -> (log_p_matrix, weights)
+
+        for w in terminals:
+            ctxs = terminal_ctxs[w]
+            freq = {c: n for c, n in ctxs.items()
+                    if n >= self.min_context_count}
+            if len(freq) < 20:
+                freq = dict(ctxs.most_common(100))
+            if len(freq) == 0:
+                continue
+
+            ctx_list = list(freq.keys())
+            counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
+            weights = counts / counts.sum()
+
+            ctx_tensor = torch.zeros(len(ctx_list), 2 * k, dtype=torch.long)
+            for ci, ctx in enumerate(ctx_list):
+                for j, cw in enumerate(ctx):
+                    ctx_tensor[ci, j] = self.w2i.get(cw, 0)
+
+            with torch.no_grad():
+                logits = self.single_model(ctx_tensor)
+                log_p = torch.log_softmax(logits, dim=-1).numpy()
+
+            terminal_log_p[w] = (log_p, weights)
+
+        # --- 4. Synthetic S terminal: boundary-only context ---
+        bdy_id = self.w2i[BOUNDARY]
+        s_ctx = torch.zeros(1, 2 * k, dtype=torch.long)
+        s_ctx[:, :] = bdy_id
+        with torch.no_grad():
+            s_logits = self.single_model(s_ctx)
+            s_log_p = torch.log_softmax(s_logits, dim=-1).numpy()
+        s_weights = np.array([1.0])
+        terminal_log_p['<S>'] = (s_log_p, s_weights)
+
+        # --- 5. Divergence helper ---
+        def d_renyi(u, v):
+            """D_alpha(u || v) using u's contexts."""
+            if u not in terminal_log_p or v not in self.w2i:
+                return float('inf')
+            log_p, weights = terminal_log_p[u]
+
+            if u == '<S>':
+                # S doesn't have a vocab id; use its boundary log-probs
+                # D(S || v): ratio of S's self-prediction to v's prediction
+                # under boundary context. S doesn't correspond to a word,
+                # so we skip D where u='<S>' -- it's only used as v.
+                return float('inf')
+
+            u_vid = self.w2i[u]
+            v_vid = self.w2i.get(v, None)
+            if v_vid is None:
+                return float('inf')
+
+            log_E_u = math.log(self.E_sent[u])
+            log_E_v = math.log(self.E_sent[v]) if v != '<S>' else 0.0
+
+            log_ratio = (log_p[:, u_vid] - log_p[:, v_vid]
+                         + log_E_v - log_E_u)
+
+            alpha = self.alpha
+            if alpha == float('inf'):
+                return float(np.max(log_ratio))
+            scaled = (alpha - 1) * log_ratio
+            max_s = np.max(scaled)
+            lse = max_s + np.log(
+                np.sum(weights * np.exp(scaled - max_s)))
+            return float(lse / (alpha - 1))
+
+        def d_renyi_from_s(v):
+            """D(<S> || v): divergence from S to v.
+
+            S's context distribution is a point mass on the boundary
+            context.  The divergence measures how well v is predicted
+            at boundary relative to its overall frequency.
+
+            Closed form:  D(S||v) = log E(v) - log P(v|boundary)
+            This is small when v is well-predicted at boundary
+            (S-like) and large otherwise.
+            """
+            if v not in self.w2i or v not in self.E_sent:
+                return float('inf')
+            log_p, _ = terminal_log_p['<S>']
+            v_vid = self.w2i[v]
+            log_pv_bdy = float(log_p[0, v_vid])
+            log_Ev = math.log(self.E_sent[v])
+            return log_Ev - log_pv_bdy
+
+        def d_renyi_to_s(a):
+            """D(a || <S>): divergence from terminal a to S.
+
+            Closed form using corpus statistics.  S generates only
+            length-1 sentences, so its context is pure boundary.
+            Across a's contexts, the fraction of mass at boundary
+            context is f = E_length1(a) / E_sent(a).
+
+            D(a||S) ≈ -log(f).  This is 0 when a appears only at
+            boundary (a ≡ S), and large/infinite when a rarely
+            appears as a length-1 sentence.
+            """
+            E_a = self.E_sent.get(a, 0)
+            E1_a = self.E_length1.get(a, 0)
+            if E_a <= 0:
+                return float('inf')
+            f = E1_a / E_a
+            if f <= 0:
+                return float('inf')
+            return -math.log(f)
+
+        # --- 6. Main loop: build the antichain ---
+        # Antichain is a list of terminal names (including '<S>')
+        antichain = ['<S>']
+
+        if verbose:
+            print(f"  Init: <S> (boundary)")
+
+        # Only process terminals that have precomputed log-probs
+        terminals_with_data = [w for w in terminals if w in terminal_log_p]
+
+        for a in terminals_with_data:
+            # Compare a to each element b in the antichain
+            smaller_than = []  # elements b where a < b
+            equal_to = []      # elements b where a == b
+            larger_than = []   # elements b where a > b
+
+            for b in antichain:
+                if b == '<S>':
+                    # S is an anchor with boundary-only context.
+                    # Any terminal that ever appears as a length-1
+                    # sentence contains S's distribution, so it is
+                    # strictly larger than S.
+                    E_a = self.E_sent.get(a, 0)
+                    E1_a = self.E_length1.get(a, 0)
+                    if E_a > 0 and E1_a / E_a > 1e-3:
+                        larger_than.append(b)
+                    # else: incomparable (never occurs as length-1)
+                    continue
+                else:
+                    d_ab = d_renyi(a, b)  # D(a || b)
+                    d_ba = d_renyi(b, a)  # D(b || a)
+
+                if d_ab < tau_low and d_ba > tau_high:
+                    # a's support ⊂ b's support: a is smaller
+                    smaller_than.append(b)
+                elif d_ab < tau_low and d_ba < tau_low:
+                    # Same support: equal
+                    equal_to.append(b)
+                elif d_ab > tau_high and d_ba < tau_low:
+                    # b's support ⊂ a's support: a is larger
+                    larger_than.append(b)
+                # else: incomparable
+
+            if equal_to:
+                # a is equivalent to something already in the list
+                if verbose:
+                    print(f"  Skip {a:>10} (freq={self.word_counts.get(a,0):>7}): "
+                          f"equal to {equal_to[0]}")
+                continue
+
+            if larger_than:
+                # a is larger than something in the list — not minimal
+                if verbose:
+                    print(f"  Skip {a:>10} (freq={self.word_counts.get(a,0):>7}): "
+                          f"larger than {larger_than[0]}")
+                continue
+
+            if smaller_than:
+                # a is smaller than some elements — remove them, add a
+                for b in smaller_than:
+                    antichain.remove(b)
+                antichain.append(a)
+                if verbose:
+                    removed = [b for b in smaller_than if b != '<S>']
+                    print(f"  Add  {a:>10} (freq={self.word_counts.get(a,0):>7}): "
+                          f"replaces {removed if removed else ['<S>']}, "
+                          f"antichain size={len(antichain)}")
+                continue
+
+            # Incomparable to everything — new minimal element
+            antichain.append(a)
+            if verbose:
+                print(f"  Add  {a:>10} (freq={self.word_counts.get(a,0):>7}): "
+                      f"incomparable, antichain size={len(antichain)}")
+
+        # --- 7. Extract anchors (exclude synthetic S) ---
+        selected = [w for w in antichain if w != '<S>']
+
+        self.anchors = selected
+        n_nt = len(selected)
+        self.nonterminals = ['S'] + [f'NT_{w}' for w in selected]
+        self.anchor2nt = {w: f'NT_{w}' for w in selected}
+
+        if verbose:
+            print(f"\nSelected {n_nt} minimal-distribution anchors: {selected}")
+
+        return self.anchors
+
     # ==========================================================
     # Step 4: Estimate xi parameters
     # ==========================================================
@@ -459,6 +723,80 @@ class NeuralLearner:
         if len(freq) < 20:
             freq = dict(ctxs.most_common(100))
         return freq
+
+    def _collect_gap_counts(self, verbose=False):
+        """Compute per-context correction for 1-gap vs 2-gap contexts.
+
+        The single model gives P(a | l,r) where l_r is a 1-gap context,
+        the pair model gives P(bc | l,r) where l__r is a 2-gap context.
+        To form the ratio P(lar)/P(lbcr) we need:
+
+            log P(lar) = log P(a|l_r)  + log P(l_r as 1-gap)
+            log P(lbcr)= log P(bc|l__r)+ log P(l__r as 2-gap)
+
+        So each context's log ratio needs a correction term:
+            gap_correction(l,r) = log P(l,r 1-gap) - log P(l,r 2-gap)
+                                = log(N1(l,r)/T1) - log(N2(l,r)/T2)
+
+        where N1, N2 are counts of (l,r) appearing as 1-gap / 2-gap
+        and T1, T2 are total 1-gap / 2-gap positions in the corpus.
+        """
+        k = self.k
+
+        # Collect all unique anchor contexts we need corrections for
+        needed = set()
+        for a in self.anchors:
+            needed.update(self._anchor_ctxs[a].keys())
+
+        n1_counts = Counter()
+        n2_counts = Counter()
+        total_1gap = 0
+        total_2gap = 0
+
+        for sent in self.sentences:
+            padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
+            n = len(padded)
+
+            # 1-gap: word at position i, context is k before + k after
+            for i in range(k, n - k):
+                total_1gap += 1
+                ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
+                if ctx in needed:
+                    n1_counts[ctx] += 1
+
+            # 2-gap: pair at positions i, i+1, context is k before + k after
+            for i in range(k, n - k - 1):
+                total_2gap += 1
+                ctx = tuple(padded[i - k:i] + padded[i + 2:i + k + 2])
+                if ctx in needed:
+                    n2_counts[ctx] += 1
+
+        global_offset = math.log(total_2gap) - math.log(total_1gap)
+
+        self._gap_corrections = {}
+        n_missing = 0
+        for ctx in needed:
+            c1 = n1_counts.get(ctx, 0)
+            c2 = n2_counts.get(ctx, 0)
+            if c1 > 0 and c2 > 0:
+                self._gap_corrections[ctx] = (
+                    math.log(c1) - math.log(c2) + global_offset)
+            elif c1 > 0:
+                # Context never seen with 2 gaps — use smoothed value
+                self._gap_corrections[ctx] = (
+                    math.log(c1) - math.log(0.5) + global_offset)
+                n_missing += 1
+            else:
+                self._gap_corrections[ctx] = 0.0
+
+        if verbose:
+            corrections = list(self._gap_corrections.values())
+            print(f"  Gap corrections: {len(corrections)} contexts, "
+                  f"{n_missing} missing 2-gap counts")
+            if corrections:
+                arr = np.array(corrections)
+                print(f"  mean={arr.mean():.3f}, std={arr.std():.3f}, "
+                      f"min={arr.min():.3f}, max={arr.max():.3f}")
 
     def _renyi_divergence(self, log_p, anchor_vid, b_vid,
                           log_E_a, log_E_b, weights):
@@ -535,12 +873,183 @@ class NeuralLearner:
 
         return self.lexical_xi
 
+    def _compute_pmi(self, anchor_B, anchor_C):
+        """Compute PMI(b, c) = log E(bc) - log E(b) - log E(c).
+
+        Returns:
+            (pmi, e_bc) or (None, 0) if E(bc) == 0.
+        """
+        e_bc = self.E_bigram.get((anchor_B, anchor_C), 0)
+        if e_bc == 0:
+            return None, 0
+        log_E_bc = math.log(e_bc)
+        pmi = (log_E_bc
+               - math.log(self.E_sent[anchor_B])
+               - math.log(self.E_sent[anchor_C]))
+        return pmi, e_bc
+
+    def _prepare_anchor_contexts(self, anchor):
+        """Prepare context tensors, weights, and gap corrections for an anchor.
+
+        Returns:
+            (ctx_tensor, weights, n_ctx, gap_corrections):
+            - ctx_tensor: (n_ctx, 2*k) long tensor of context word indices
+            - weights: normalised context weights
+            - n_ctx: number of contexts
+            - gap_corrections: numpy array of per-context log(P(1-gap)/P(2-gap)),
+              or None if _collect_gap_counts has not been called.
+        """
+        k = self.k
+        freq = self._get_filtered_contexts(anchor)
+        ctx_list = list(freq.keys())
+        counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
+        weights = counts / counts.sum()
+        n_ctx = len(ctx_list)
+
+        ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
+        for ci, ctx in enumerate(ctx_list):
+            for j, w in enumerate(ctx):
+                ctx_tensor[ci, j] = self.w2i.get(w, 0)
+
+        gap_corrections = None
+        if hasattr(self, '_gap_corrections'):
+            gap_corrections = np.array([
+                self._gap_corrections.get(ctx, 0.0) for ctx in ctx_list
+            ])
+
+        return ctx_tensor, weights, n_ctx, gap_corrections
+
+    def _single_model_log_probs(self, ctx_tensor, word_vid):
+        """Compute log P(word | ctx) for each context using the single model.
+
+        Returns:
+            numpy array of shape (n_ctx,).
+        """
+        with torch.no_grad():
+            logits = self.single_model(ctx_tensor)
+            log_p = torch.log_softmax(logits, dim=-1)[:, word_vid].numpy()
+        return log_p
+
+    def _pair_model_log_probs(self, ctx_tensor, b_vid, c_vid):
+        """Compute log P(b, c | ctx) = log P(b|ctx) + log P(c|ctx, b)
+        for each context using the pair model.
+
+        Returns:
+            numpy array of shape (n_ctx,).
+        """
+        n_ctx = ctx_tensor.shape[0]
+        with torch.no_grad():
+            logits1 = self.pair_model.forward(ctx_tensor)
+            log_p_b = torch.log_softmax(
+                logits1, dim=-1)[:, b_vid].numpy()
+            b_tensor = torch.full((n_ctx,), b_vid, dtype=torch.long)
+            _, logits2 = self.pair_model.forward(ctx_tensor, b_tensor)
+            log_p_c = torch.log_softmax(
+                logits2, dim=-1)[:, c_vid].numpy()
+        return log_p_b + log_p_c
+
+    def _renyi_from_log_ratio(self, log_ratio, weights):
+        """Compute Rényi divergence from pre-computed log ratios and weights.
+
+        D_alpha = (1/(alpha-1)) * log E_weights[ exp((alpha-1) * log_ratio) ]
+
+        Returns:
+            float divergence value.
+        """
+        alpha = self.alpha
+        if alpha == float('inf'):
+            return float(np.max(log_ratio))
+        scaled = (alpha - 1) * log_ratio
+        max_s = np.max(scaled)
+        lse = max_s + np.log(np.sum(weights * np.exp(scaled - max_s)))
+        return float(lse / (alpha - 1))
+
+    def _binary_divergence(self, log_p_a, log_E_a, log_p_bc, log_E_bc,
+                           weights, gap_corrections=None):
+        """Compute D_alpha(a || bc) from single and pair model log probs.
+
+        The single model gives P(a | l,r) for 1-gap contexts, the pair
+        model gives P(bc | l,r) for 2-gap contexts.  To form the correct
+        ratio P(lar)/P(lbcr) we need to correct for the different
+        marginal probabilities of seeing context (l,r) with 1 vs 2 gaps:
+
+        log_ratio[ctx] = (log P(a|ctx) - log E(a))
+                       - (log P(bc|ctx) - log E(bc))
+                       + gap_correction(ctx)
+
+        where gap_correction = log P(ctx as 1-gap) - log P(ctx as 2-gap).
+
+        Returns:
+            float divergence value.
+        """
+        log_ratio = (log_p_a - log_E_a) - (log_p_bc - log_E_bc)
+        if gap_corrections is not None:
+            log_ratio = log_ratio + gap_corrections
+        return self._renyi_from_log_ratio(log_ratio, weights)
+
+    def _estimate_S_binary_xi(self):
+        """Estimate xi(S -> BC) for all anchor pairs B, C.
+
+        xi(S -> BC) = E_length2(bc) / (E(b) * E(c))
+        These come directly from the frequency of bc as a length-2 sentence.
+        """
+        for anchor_B in self.anchors:
+            nt_B = self.anchor2nt[anchor_B]
+            for anchor_C in self.anchors:
+                nt_C = self.anchor2nt[anchor_C]
+                e_l2 = self.E_length2.get(
+                    (anchor_B, anchor_C), 0)
+                e_b = self.E_sent[anchor_B]
+                e_c = self.E_sent[anchor_C]
+                xi = e_l2 / (e_b * e_c) if (e_b > 0 and e_c > 0) else 0
+                self.binary_xi[('S', nt_B, nt_C)] = xi
+
+    def _estimate_nonS_binary_xi(self):
+        """Estimate xi(A -> BC) for all non-S anchors A and anchor pairs B, C.
+
+        xi(A -> BC) = exp(PMI(b,c)) * exp(-D_alpha(a || bc))
+        where PMI(b,c) = log E(bc) - log E(b) - log E(c)
+        and D_alpha uses the single model for P(a|ctx) and pair model
+        for P(bc|ctx), with a per-context gap correction.
+        """
+        for anchor_A in self.anchors:
+            nt_A = self.anchor2nt[anchor_A]
+            a_vid = self.w2i[anchor_A]
+            log_E_a = math.log(self.E_sent[anchor_A])
+
+            ctx_tensor, weights, n_ctx, gap_corrections = (
+                self._prepare_anchor_contexts(anchor_A))
+            log_p_a = self._single_model_log_probs(ctx_tensor, a_vid)
+
+            for anchor_B in self.anchors:
+                nt_B = self.anchor2nt[anchor_B]
+                b_vid = self.w2i[anchor_B]
+
+                for anchor_C in self.anchors:
+                    nt_C = self.anchor2nt[anchor_C]
+                    c_vid = self.w2i[anchor_C]
+
+                    pmi, e_bc = self._compute_pmi(anchor_B, anchor_C)
+                    if pmi is None:
+                        self.binary_xi[(nt_A, nt_B, nt_C)] = 0
+                        continue
+
+                    log_E_bc = math.log(e_bc)
+                    log_p_bc = self._pair_model_log_probs(
+                        ctx_tensor, b_vid, c_vid)
+
+                    d = self._binary_divergence(
+                        log_p_a, log_E_a, log_p_bc, log_E_bc,
+                        weights, gap_corrections)
+
+                    xi = math.exp(pmi - d)
+                    self.binary_xi[(nt_A, nt_B, nt_C)] = xi
+
     def estimate_binary_xi(self, verbose=True):
         """Estimate xi(A -> BC) for all triples of NTs.
 
         For non-S parents:
-          xi(A -> BC) = E(bc)/(E(b)*E(c)) * exp(-D_alpha(anchor_A || bc))
-          where D uses single model for P(a|l,r) and pair model for P(bc|l,r)
+          xi(A -> BC) = exp(PMI(b,c)) * exp(-D_alpha(anchor_A || bc))
 
         For S:
           xi(S -> BC) = E_length2(bc) / (E(b) * E(c))
@@ -558,87 +1067,12 @@ class NeuralLearner:
         if not hasattr(self, '_anchor_ctxs'):
             self._collect_anchor_contexts()
 
-        k = self.k
+        self._collect_gap_counts(verbose=verbose)
+
         self.binary_xi = {}
 
-        # Non-S parents: use divergence
-        for anchor_A in self.anchors:
-            nt_A = self.anchor2nt[anchor_A]
-            a_vid = self.w2i[anchor_A]
-            log_E_a = math.log(self.E_sent[anchor_A])
-
-            freq = self._get_filtered_contexts(anchor_A)
-            ctx_list = list(freq.keys())
-            counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
-            weights = counts / counts.sum()
-            n_ctx = len(ctx_list)
-
-            ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
-            for ci, ctx in enumerate(ctx_list):
-                for j, w in enumerate(ctx):
-                    ctx_tensor[ci, j] = self.w2i.get(w, 0)
-
-            # Single model: log P(a | ctx) for all contexts
-            with torch.no_grad():
-                logits_s = self.single_model(ctx_tensor)
-                log_p_a = torch.log_softmax(
-                    logits_s, dim=-1)[:, a_vid].numpy()
-
-            for anchor_B in self.anchors:
-                nt_B = self.anchor2nt[anchor_B]
-                b_vid = self.w2i[anchor_B]
-
-                for anchor_C in self.anchors:
-                    nt_C = self.anchor2nt[anchor_C]
-                    c_vid = self.w2i[anchor_C]
-
-                    e_bc = self.E_bigram.get(
-                        (anchor_B, anchor_C), 0)
-                    if e_bc == 0:
-                        self.binary_xi[(nt_A, nt_B, nt_C)] = 0
-                        continue
-
-                    log_E_bc = math.log(e_bc)
-                    pmi = (log_E_bc - math.log(self.E_sent[anchor_B])
-                           - math.log(self.E_sent[anchor_C]))
-
-                    # Pair model: log P(b, c | ctx)
-                    with torch.no_grad():
-                        logits1 = self.pair_model.forward(ctx_tensor)
-                        log_p_b = torch.log_softmax(
-                            logits1, dim=-1)[:, b_vid].numpy()
-                        b_tensor = torch.full(
-                            (n_ctx,), b_vid, dtype=torch.long)
-                        _, logits2 = self.pair_model.forward(
-                            ctx_tensor, b_tensor)
-                        log_p_c = torch.log_softmax(
-                            logits2, dim=-1)[:, c_vid].numpy()
-
-                    log_p_bc = log_p_b + log_p_c
-                    log_ratio = ((log_p_a - log_E_a)
-                                 - (log_p_bc - log_E_bc))
-
-                    alpha = self.alpha
-                    scaled = (alpha - 1) * log_ratio
-                    max_s = np.max(scaled)
-                    lse = max_s + np.log(
-                        np.sum(weights * np.exp(scaled - max_s)))
-                    d = lse / (alpha - 1)
-
-                    xi = math.exp(pmi - d)
-                    self.binary_xi[(nt_A, nt_B, nt_C)] = xi
-
-        # S rules: from length-2 sentence counts
-        for anchor_B in self.anchors:
-            nt_B = self.anchor2nt[anchor_B]
-            for anchor_C in self.anchors:
-                nt_C = self.anchor2nt[anchor_C]
-                e_l2 = self.E_length2.get(
-                    (anchor_B, anchor_C), 0)
-                e_b = self.E_sent[anchor_B]
-                e_c = self.E_sent[anchor_C]
-                xi = e_l2 / (e_b * e_c) if (e_b > 0 and e_c > 0) else 0
-                self.binary_xi[('S', nt_B, nt_C)] = xi
+        self._estimate_nonS_binary_xi()
+        self._estimate_S_binary_xi()
 
         if verbose:
             n_nonzero = sum(1 for v in self.binary_xi.values() if v > 0)

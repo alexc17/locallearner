@@ -235,6 +235,173 @@ class PairClozeModel(nn.Module):
         return log_p_w1, log_p_w2
 
 
+class PositionalClozeModel(nn.Module):
+    """Position-aware cloze model: predict center word from context window.
+
+    Architecture:
+        context words -> shared embedding -> concatenate positions ->
+        hidden1 (ReLU) -> hidden2 (ReLU) -> output (softmax)
+
+    Unlike ClozeModel which averages context embeddings (bag-of-words),
+    this model concatenates them, preserving positional information and
+    allowing the hidden layers to learn joint interactions between
+    context positions.
+    """
+
+    def __init__(self, vocab_size, n_context, embedding_dim=64, hidden_dim=128):
+        """
+        Args:
+            vocab_size: number of words in vocabulary
+            n_context: number of context positions (2k for window size k)
+            embedding_dim: dimension of word embeddings
+            hidden_dim: dimension of hidden layers
+        """
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.n_context = n_context
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        input_dim = n_context * embedding_dim
+        self.hidden1 = nn.Linear(input_dim, hidden_dim)
+        self.hidden2 = nn.Linear(hidden_dim, hidden_dim)
+        self.output = nn.Linear(hidden_dim, vocab_size)
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.embedding.weight)
+        for layer in [self.hidden1, self.hidden2, self.output]:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, context):
+        """
+        Args:
+            context: (batch, 2k) integer tensor of context word indices
+
+        Returns:
+            logits: (batch, vocab_size) unnormalized log-probabilities
+        """
+        # (batch, 2k, embedding_dim)
+        emb = self.embedding(context)
+        # Concatenate all positions: (batch, 2k * embedding_dim)
+        flat = emb.view(emb.size(0), -1)
+        # Two hidden layers with ReLU
+        h = torch.relu(self.hidden1(flat))
+        h = torch.relu(self.hidden2(h))
+        # Output logits: (batch, vocab_size)
+        logits = self.output(h)
+        return logits
+
+    def log_probs(self, context):
+        """Compute log P(w | context) for all words w."""
+        logits = self.forward(context)
+        return torch.log_softmax(logits, dim=-1)
+
+
+class PositionalPairClozeModel(nn.Module):
+    """Position-aware pair cloze model: predict two adjacent words from context.
+
+    Uses autoregressive factorization:
+        P(w1, w2 | ctx) = P(w1 | ctx) * P(w2 | ctx, w1)
+
+    Architecture:
+        context words -> shared embedding -> concatenate positions ->
+        hidden1a (ReLU) -> hidden1b (ReLU) -> w1 logits
+        [hidden1b ; w1_embedding] -> hidden2a (ReLU) -> hidden2b (ReLU) -> w2 logits
+
+    Unlike PairClozeModel which averages context embeddings, this model
+    concatenates them to preserve positional and joint information.
+    """
+
+    def __init__(self, vocab_size, n_context, embedding_dim=64, hidden_dim=128):
+        """
+        Args:
+            vocab_size: number of words in vocabulary
+            n_context: number of context positions (2k for window size k)
+            embedding_dim: dimension of word embeddings
+            hidden_dim: dimension of hidden layers
+        """
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.n_context = n_context
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        input_dim = n_context * embedding_dim
+
+        # First word prediction: two hidden layers
+        self.hidden1a = nn.Linear(input_dim, hidden_dim)
+        self.hidden1b = nn.Linear(hidden_dim, hidden_dim)
+        self.output1 = nn.Linear(hidden_dim, vocab_size)
+
+        # Second word prediction: two hidden layers, conditioned on w1
+        self.hidden2a = nn.Linear(hidden_dim + embedding_dim, hidden_dim)
+        self.hidden2b = nn.Linear(hidden_dim, hidden_dim)
+        self.output2 = nn.Linear(hidden_dim, vocab_size)
+
+        # Initialize weights
+        nn.init.xavier_uniform_(self.embedding.weight)
+        for layer in [self.hidden1a, self.hidden1b, self.output1,
+                      self.hidden2a, self.hidden2b, self.output2]:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, context, w1=None):
+        """
+        Args:
+            context: (batch, 2k) integer tensor of context word indices
+            w1: (batch,) integer tensor of first word (for teacher forcing).
+                If None, only returns logits1.
+
+        Returns:
+            logits1: (batch, vocab_size) logits for first word
+            logits2: (batch, vocab_size) logits for second word (only if w1 given)
+        """
+        emb = self.embedding(context)            # (batch, 2k, emb_dim)
+        flat = emb.view(emb.size(0), -1)         # (batch, 2k * emb_dim)
+        h1 = torch.relu(self.hidden1a(flat))     # (batch, hidden_dim)
+        h1 = torch.relu(self.hidden1b(h1))       # (batch, hidden_dim)
+        logits1 = self.output1(h1)               # (batch, vocab_size)
+
+        if w1 is None:
+            return logits1
+
+        w1_emb = self.embedding(w1)              # (batch, emb_dim)
+        h2 = torch.relu(self.hidden2a(torch.cat([h1, w1_emb], dim=-1)))
+        h2 = torch.relu(self.hidden2b(h2))       # (batch, hidden_dim)
+        logits2 = self.output2(h2)               # (batch, vocab_size)
+        return logits1, logits2
+
+    def log_prob_w1(self, context):
+        """log P(w1 | context) for all w1."""
+        logits1 = self.forward(context)
+        return torch.log_softmax(logits1, dim=-1)
+
+    def log_prob_w2(self, context, w1):
+        """log P(w2 | context, w1) for all w2."""
+        _, logits2 = self.forward(context, w1)
+        return torch.log_softmax(logits2, dim=-1)
+
+    def log_prob_pair(self, context, w1):
+        """log P(w1, w2 | context) = log P(w1|ctx) + log P(w2|ctx,w1) for all w2.
+
+        Args:
+            context: (batch, 2k) integer tensor
+            w1: (batch,) integer tensor of first word
+
+        Returns:
+            log_p_w1: (batch,) log P(w1 | context) for the given w1
+            log_p_w2: (batch, vocab_size) log P(w2 | context, w1) for all w2
+        """
+        logits1, logits2 = self.forward(context, w1)
+        log_p1_all = torch.log_softmax(logits1, dim=-1)
+        log_p_w1 = log_p1_all.gather(1, w1.unsqueeze(1)).squeeze(1)
+        log_p_w2 = torch.log_softmax(logits2, dim=-1)
+        return log_p_w1, log_p_w2
+
+
 def train_pair_cloze_model(sentences, k=2, embedding_dim=64, hidden_dim=128,
                            n_epochs=5, batch_size=4096, lr=1e-3,
                            min_count=1, seed=42, verbose=True, device=None):
@@ -442,6 +609,169 @@ def train_cloze_model(sentences, k=2, embedding_dim=64, hidden_dim=128,
     return model, word2idx, idx2word, history
 
 
+def train_positional_cloze_model(sentences, k=2, embedding_dim=64, hidden_dim=128,
+                                 n_epochs=5, batch_size=4096, lr=1e-3,
+                                 min_count=1, seed=42, verbose=True, device=None):
+    """Train a positional cloze model on the given sentences.
+
+    Same interface as train_cloze_model but returns a PositionalClozeModel.
+    """
+    if device is None:
+        device = torch.device('mps' if torch.backends.mps.is_available()
+                              else 'cuda' if torch.cuda.is_available()
+                              else 'cpu')
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    if verbose:
+        print(f"Building vocabulary (min_count={min_count})...")
+    word2idx, idx2word = build_vocab(sentences, min_count=min_count)
+    vocab_size = len(word2idx)
+    if verbose:
+        print(f"  Vocabulary size: {vocab_size}")
+
+    if verbose:
+        print(f"Extracting contexts (k={k})...")
+    t0 = time.time()
+    dataset = ClozeDataset(sentences, word2idx, k=k)
+    if verbose:
+        print(f"  {len(dataset)} training examples ({time.time()-t0:.1f}s)")
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=0, pin_memory=False)
+
+    n_context = 2 * k
+    model = PositionalClozeModel(vocab_size, n_context, embedding_dim, hidden_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"PositionalClozeModel: {n_params:,} parameters, device={device}")
+        print(f"  input_dim={n_context}*{embedding_dim}={n_context*embedding_dim}, "
+              f"hidden_dim={hidden_dim}")
+        print(f"Training for {n_epochs} epochs...")
+
+    history = {'epoch_loss': [], 'batch_losses': []}
+
+    for epoch in range(n_epochs):
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        t0 = time.time()
+
+        for ctx_batch, tgt_batch in dataloader:
+            ctx_batch = ctx_batch.to(device)
+            tgt_batch = tgt_batch.to(device)
+
+            optimizer.zero_grad()
+            logits = model(ctx_batch)
+            loss = criterion(logits, tgt_batch)
+            loss.backward()
+            optimizer.step()
+
+            batch_loss = loss.item()
+            total_loss += batch_loss
+            n_batches += 1
+            history['batch_losses'].append(batch_loss)
+
+        avg_loss = total_loss / n_batches
+        history['epoch_loss'].append(avg_loss)
+        elapsed = time.time() - t0
+
+        if verbose:
+            ppl = np.exp(avg_loss)
+            print(f"  Epoch {epoch+1}/{n_epochs}: "
+                  f"loss={avg_loss:.4f}, ppl={ppl:.1f}, "
+                  f"time={elapsed:.1f}s")
+
+    model.eval()
+    return model, word2idx, idx2word, history
+
+
+def train_positional_pair_cloze_model(sentences, k=2, embedding_dim=64, hidden_dim=128,
+                                       n_epochs=5, batch_size=4096, lr=1e-3,
+                                       min_count=1, seed=42, verbose=True, device=None):
+    """Train a positional pair cloze model on the given sentences.
+
+    Same interface as train_pair_cloze_model but returns a PositionalPairClozeModel.
+    """
+    if device is None:
+        device = torch.device('mps' if torch.backends.mps.is_available()
+                              else 'cuda' if torch.cuda.is_available()
+                              else 'cpu')
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    if verbose:
+        print(f"Building vocabulary (min_count={min_count})...")
+    word2idx, idx2word = build_vocab(sentences, min_count=min_count)
+    vocab_size = len(word2idx)
+    if verbose:
+        print(f"  Vocabulary size: {vocab_size}")
+
+    if verbose:
+        print(f"Extracting pair contexts (k={k})...")
+    t0 = time.time()
+    dataset = PairClozeDataset(sentences, word2idx, k=k)
+    if verbose:
+        print(f"  {len(dataset)} training examples ({time.time()-t0:.1f}s)")
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=0, pin_memory=False)
+
+    n_context = 2 * k
+    model = PositionalPairClozeModel(vocab_size, n_context, embedding_dim, hidden_dim).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"PositionalPairClozeModel: {n_params:,} parameters, device={device}")
+        print(f"  input_dim={n_context}*{embedding_dim}={n_context*embedding_dim}, "
+              f"hidden_dim={hidden_dim}")
+        print(f"Training for {n_epochs} epochs...")
+
+    history = {'epoch_loss': [], 'batch_losses': []}
+
+    for epoch in range(n_epochs):
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        t0 = time.time()
+
+        for ctx_batch, tgt1_batch, tgt2_batch in dataloader:
+            ctx_batch = ctx_batch.to(device)
+            tgt1_batch = tgt1_batch.to(device)
+            tgt2_batch = tgt2_batch.to(device)
+
+            optimizer.zero_grad()
+            logits1, logits2 = model(ctx_batch, tgt1_batch)
+            loss = criterion(logits1, tgt1_batch) + criterion(logits2, tgt2_batch)
+            loss.backward()
+            optimizer.step()
+
+            batch_loss = loss.item()
+            total_loss += batch_loss
+            n_batches += 1
+            history['batch_losses'].append(batch_loss)
+
+        avg_loss = total_loss / n_batches
+        history['epoch_loss'].append(avg_loss)
+        elapsed = time.time() - t0
+
+        if verbose:
+            ppl = np.exp(avg_loss / 2)
+            print(f"  Epoch {epoch+1}/{n_epochs}: "
+                  f"loss={avg_loss:.4f}, ppl/word={ppl:.1f}, "
+                  f"time={elapsed:.1f}s")
+
+    model.eval()
+    return model, word2idx, idx2word, history
+
+
 def save_model(model, word2idx, idx2word, path, k=2, history=None):
     """Save trained model and vocabulary to disk.
 
@@ -453,7 +783,15 @@ def save_model(model, word2idx, idx2word, path, k=2, history=None):
         k: context window size used during training
         history: training history dict (optional)
     """
-    model_type = 'pair' if isinstance(model, PairClozeModel) else 'single'
+    if isinstance(model, PositionalPairClozeModel):
+        model_type = 'positional_pair'
+    elif isinstance(model, PositionalClozeModel):
+        model_type = 'positional_single'
+    elif isinstance(model, PairClozeModel):
+        model_type = 'pair'
+    else:
+        model_type = 'single'
+
     checkpoint = {
         'model_type': model_type,
         'model_state_dict': model.state_dict(),
@@ -464,6 +802,8 @@ def save_model(model, word2idx, idx2word, path, k=2, history=None):
         'idx2word': idx2word,
         'k': k,
     }
+    if hasattr(model, 'n_context'):
+        checkpoint['n_context'] = model.n_context
     if history is not None:
         checkpoint['history'] = history
     torch.save(checkpoint, path)
@@ -491,7 +831,21 @@ def load_model(path, device=None):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model_type = checkpoint.get('model_type', 'single')
 
-    if model_type == 'pair':
+    if model_type == 'positional_pair':
+        model = PositionalPairClozeModel(
+            checkpoint['vocab_size'],
+            checkpoint['n_context'],
+            checkpoint['embedding_dim'],
+            checkpoint['hidden_dim'],
+        ).to(device)
+    elif model_type == 'positional_single':
+        model = PositionalClozeModel(
+            checkpoint['vocab_size'],
+            checkpoint['n_context'],
+            checkpoint['embedding_dim'],
+            checkpoint['hidden_dim'],
+        ).to(device)
+    elif model_type == 'pair':
         model = PairClozeModel(
             checkpoint['vocab_size'],
             checkpoint['embedding_dim'],

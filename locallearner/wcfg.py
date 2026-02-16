@@ -440,39 +440,59 @@ class WCFG:
 		newone.trim_zeros()
 		return newone
 
-	def estimate_inside_outside_from_list(self, data, maxlength, maxcount, robust=True, stepsize=1.0):
+	def estimate_inside_outside_from_list(self, data, maxlength, maxcount, robust=True, stepsize=1.0, verbose=0):
 		"""
-		Create a new grammar with parameters re-estimated via Inside-Outside.
+		Run one full epoch of Inside-Outside over the data.
 
-		When stepsize < 1.0, the new parameters are an interpolation
-		between the current parameters and the MLE from the mini-batch:
+		The data is processed in mini-batches of size maxcount.
+		After each mini-batch, the grammar parameters are updated.
+
+		When stepsize < 1.0, each mini-batch update interpolates
+		between the current parameters and the mini-batch MLE:
 		  new_param = (1 - stepsize) * old_param + stepsize * mle_param
 		This ensures that productions unseen in the mini-batch are
 		shrunk but not zeroed out.
 
 		When stepsize == 1.0 (default), this is standard batch EM:
-		the parameters are replaced entirely by the MLE from the data.
+		a single pass accumulating posteriors over all eligible sentences
+		(up to maxcount if fewer than len(data)), then replacing
+		parameters with the MLE.
+
+		verbose: 0 = summary only, N>0 = print stats every N mini-batches.
+
+		Returns a new grammar with updated parameters.
 		"""
-		nlines = 0
-		io = InsideComputation(self)
-		
-		posteriors = defaultdict(float)
-		for s in data:
-			if len(s) <= maxlength:
-				try:
-					io.add_posteriors(s, posteriors)
-				except ParseFailureException as e:
-					if robust:
-						print("Failed to parse:",s)
-					else:
-						raise e
-				
-				nlines += 1
-			if nlines >= maxcount:
-				break
+		import time as _time
+		n_parsed = 0
+		n_failed = 0
+		n_skipped_long = 0
+		t_start = _time.time()
 
 		if stepsize >= 1.0:
-			# Standard batch EM: replace parameters with MLE
+			# Standard batch EM: single accumulation over all data
+			nlines = 0
+			io = InsideComputation(self)
+			posteriors = defaultdict(float)
+			for s in data:
+				if len(s) > maxlength:
+					n_skipped_long += 1
+					continue
+				try:
+					io.add_posteriors(s, posteriors)
+					n_parsed += 1
+				except ParseFailureException as e:
+					if robust:
+						n_failed += 1
+					else:
+						raise e
+				nlines += 1
+				if maxcount and nlines >= maxcount:
+					break
+
+			elapsed = _time.time() - t_start
+			print(f"IO epoch: {n_parsed} parsed, {n_failed} parse failures, "
+				  f"{n_skipped_long} skipped (len>{maxlength}) [{elapsed:.1f}s]")
+
 			newone = self.copy()
 			newone.parameters = posteriors
 			for prod in self.productions:
@@ -482,24 +502,82 @@ class WCFG:
 			newone.trim_zeros()
 			return newone
 		else:
-			# Interpolate old parameters with mini-batch MLE.
-			# First locally normalise the posteriors.
-			totals = defaultdict(float)
-			for prod in self.productions:
-				totals[prod[0]] += posteriors.get(prod, 0.0)
+			# SGD: process data in mini-batches, updating after each
+			current = self
+			nlines = 0
+			n_updates = 0
+			batch_failed = 0
+			io = InsideComputation(current)
+			posteriors = defaultdict(float)
 
-			newone = self.copy()
-			for prod in self.productions:
-				old_p = self.parameters[prod]
-				lhs_total = totals[prod[0]]
-				if lhs_total > 0:
-					mle_p = posteriors.get(prod, 0.0) / lhs_total
-				else:
-					mle_p = old_p
-				newone.parameters[prod] = (1 - stepsize) * old_p + stepsize * mle_p
-			newone.locally_normalise_lax()
-			newone.trim_zeros()
-			return newone
+			for s in data:
+				if len(s) > maxlength:
+					n_skipped_long += 1
+					continue
+				try:
+					io.add_posteriors(s, posteriors)
+					n_parsed += 1
+				except ParseFailureException as e:
+					if robust:
+						n_failed += 1
+						batch_failed += 1
+					else:
+						raise e
+				nlines += 1
+
+				if nlines >= maxcount:
+					# Apply mini-batch update
+					current = current._apply_minibatch_update(posteriors, stepsize)
+					n_updates += 1
+					if verbose > 0 and n_updates % verbose == 0:
+						elapsed = _time.time() - t_start
+						print(f"  batch {n_updates}: {n_parsed} parsed, "
+							  f"{n_failed} failures ({batch_failed} this batch), "
+							  f"E[len]={current.expected_length():.3f}, "
+							  f"terms={len(current.terminals)} [{elapsed:.1f}s]")
+					# Reset for next mini-batch
+					io = InsideComputation(current)
+					posteriors = defaultdict(float)
+					nlines = 0
+					batch_failed = 0
+
+			# Apply final partial mini-batch if any
+			if nlines > 0:
+				current = current._apply_minibatch_update(posteriors, stepsize)
+				n_updates += 1
+				if verbose > 0:
+					elapsed = _time.time() - t_start
+					print(f"  batch {n_updates} (final, {nlines} sentences): "
+						  f"{n_parsed} parsed, {n_failed} failures, "
+						  f"E[len]={current.expected_length():.3f}, "
+						  f"terms={len(current.terminals)} [{elapsed:.1f}s]")
+
+			elapsed = _time.time() - t_start
+			print(f"IO epoch: {n_parsed} parsed, {n_failed} parse failures, "
+				  f"{n_skipped_long} skipped (len>{maxlength}), "
+				  f"{n_updates} mini-batch updates [{elapsed:.1f}s]")
+
+			return current
+
+	def _apply_minibatch_update(self, posteriors, stepsize):
+		"""Apply a single SGD update: interpolate old params with mini-batch MLE."""
+		totals = defaultdict(float)
+		for prod in self.productions:
+			totals[prod[0]] += posteriors.get(prod, 0.0)
+
+		newone = self.copy()
+		for prod in self.productions:
+			old_p = self.parameters[prod]
+			lhs_total = totals[prod[0]]
+			if lhs_total > 0:
+				mle_p = posteriors.get(prod, 0.0) / lhs_total
+			else:
+				mle_p = old_p
+			newone.parameters[prod] = (1 - stepsize) * old_p + stepsize * mle_p
+		newone.locally_normalise_lax()
+		newone.trim_zeros()
+		newone.set_log_parameters()
+		return newone
 
 
 	def estimate_string_density(self, length, nsamples):
