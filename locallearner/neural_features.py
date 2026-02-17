@@ -772,6 +772,325 @@ def train_positional_pair_cloze_model(sentences, k=2, embedding_dim=64, hidden_d
     return model, word2idx, idx2word, history
 
 
+# ============================================================
+# RNN-based cloze model with variable-length contexts
+# ============================================================
+
+class RNNClozeDataset(Dataset):
+    """Dataset of (left_context, right_context, target) for RNN cloze model.
+
+    For each word w_i in the corpus, the left context is the sequence
+    from BOUNDARY through w_{i-1}, and the right context is from
+    w_{i+1+gap} through BOUNDARY.  Contexts are variable length.
+
+    Args:
+        sentences: list of word lists
+        word2idx: vocabulary mapping
+        gap: number of extra words to skip on the right side (default 0).
+             gap=0 is the normal single-word cloze model.
+             gap=1 skips one word on the right, for pair prediction.
+
+    Uses flat arrays with offsets for memory efficiency.
+    """
+
+    def __init__(self, sentences, word2idx, gap=0):
+        bdy_idx = word2idx[BOUNDARY]
+        self.gap = gap
+
+        # First pass: count total examples and total context tokens
+        n_examples = sum(len(s) for s in sentences)
+
+        targets = np.empty(n_examples, dtype=np.int64)
+        left_offsets = np.empty(n_examples + 1, dtype=np.int64)
+        right_offsets = np.empty(n_examples + 1, dtype=np.int64)
+
+        # Compute offsets
+        # Left context: [bdy] + ids[:i], length = i + 1
+        # Right context: ids[i+1+gap:] + [bdy], length = max(1, n - i - gap)
+        left_offsets[0] = 0
+        right_offsets[0] = 0
+        idx = 0
+        for sent in sentences:
+            n = len(sent)
+            for i in range(n):
+                left_offsets[idx + 1] = left_offsets[idx] + (i + 1)
+                r_len = max(1, n - i - gap)
+                right_offsets[idx + 1] = right_offsets[idx] + r_len
+                idx += 1
+
+        total_left = int(left_offsets[n_examples])
+        total_right = int(right_offsets[n_examples])
+
+        left_data = np.empty(total_left, dtype=np.int64)
+        right_data = np.empty(total_right, dtype=np.int64)
+
+        # Second pass: fill data
+        idx = 0
+        for sent in sentences:
+            ids = [word2idx.get(w, 0) for w in sent]
+            n = len(ids)
+            for i in range(n):
+                # Left context: [bdy] + ids[:i]
+                lo = int(left_offsets[idx])
+                left_data[lo] = bdy_idx
+                for j in range(i):
+                    left_data[lo + 1 + j] = ids[j]
+
+                # Right context: ids[i+1+gap:] + [bdy]
+                ro = int(right_offsets[idx])
+                r_start = i + 1 + gap
+                r_count = 0
+                for j in range(r_start, n):
+                    right_data[ro + r_count] = ids[j]
+                    r_count += 1
+                right_data[ro + r_count] = bdy_idx
+
+                targets[idx] = ids[i]
+                idx += 1
+
+        self.targets = targets
+        self.left_data = left_data
+        self.right_data = right_data
+        self.left_offsets = left_offsets
+        self.right_offsets = right_offsets
+
+    def __len__(self):
+        return len(self.targets)
+
+    def __getitem__(self, idx):
+        lo = int(self.left_offsets[idx])
+        lend = int(self.left_offsets[idx + 1])
+        ro = int(self.right_offsets[idx])
+        rend = int(self.right_offsets[idx + 1])
+        return (torch.from_numpy(self.left_data[lo:lend]),
+                torch.from_numpy(self.right_data[ro:rend]),
+                self.targets[idx])
+
+
+def rnn_collate_fn(batch):
+    """Collate variable-length left/right contexts into padded batches."""
+    lefts, rights, targets = zip(*batch)
+    left_lens = [len(l) for l in lefts]
+    right_lens = [len(r) for r in rights]
+    max_left = max(left_lens)
+    max_right = max(right_lens)
+
+    # Pad with zeros (will be masked by pack_padded_sequence)
+    left_padded = torch.zeros(len(lefts), max_left, dtype=torch.long)
+    right_padded = torch.zeros(len(rights), max_right, dtype=torch.long)
+    for i, (l, r) in enumerate(zip(lefts, rights)):
+        left_padded[i, :len(l)] = l
+        right_padded[i, :len(r)] = r
+
+    targets = torch.tensor(targets, dtype=torch.long)
+    left_lens = torch.tensor(left_lens, dtype=torch.long)
+    right_lens = torch.tensor(right_lens, dtype=torch.long)
+    return left_padded, right_padded, left_lens, right_lens, targets
+
+
+class RNNClozeModel(nn.Module):
+    """Bidirectional RNN cloze model with variable-length contexts.
+
+    Architecture:
+        left context  -> GRU (left-to-right)  -> h_L
+        right context -> GRU (right-to-left)  -> h_R
+        [h_L, h_R] -> hidden (ReLU) -> output (softmax)
+
+    Shared embedding between both directions.
+    """
+
+    def __init__(self, vocab_size, embedding_dim=64, hidden_dim=128,
+                 gru_dim=128, n_gru_layers=1, gap=0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.gru_dim = gru_dim
+        self.n_gru_layers = n_gru_layers
+        self.gap = gap  # 0=normal, 1=gap model for pair prediction
+
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.left_gru = nn.GRU(embedding_dim, gru_dim,
+                               num_layers=n_gru_layers, batch_first=True)
+        self.right_gru = nn.GRU(embedding_dim, gru_dim,
+                                num_layers=n_gru_layers, batch_first=True)
+        self.hidden = nn.Linear(2 * gru_dim, hidden_dim)
+        self.output = nn.Linear(hidden_dim, vocab_size)
+
+        nn.init.xavier_uniform_(self.embedding.weight)
+        nn.init.xavier_uniform_(self.hidden.weight)
+        nn.init.zeros_(self.hidden.bias)
+        nn.init.xavier_uniform_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward_unpacked(self, left_ctx, right_ctx):
+        """Forward pass without packing (for inference with small batches).
+
+        Args:
+            left_ctx:  (batch, L) int tensor — left context, left-to-right
+            right_ctx: (batch, R) int tensor — right context, left-to-right
+
+        Returns:
+            logits: (batch, vocab_size)
+        """
+        left_emb = self.embedding(left_ctx)
+        right_emb = self.embedding(right_ctx)
+
+        # Reverse right context for right-to-left processing
+        right_emb_rev = torch.flip(right_emb, [1])
+
+        _, h_L = self.left_gru(left_emb)    # h_L: (n_layers, batch, gru_dim)
+        _, h_R = self.right_gru(right_emb_rev)  # h_R: same
+
+        # Take final layer hidden state
+        h_L = h_L[-1]  # (batch, gru_dim)
+        h_R = h_R[-1]
+
+        combined = torch.cat([h_L, h_R], dim=-1)  # (batch, 2*gru_dim)
+        h = torch.relu(self.hidden(combined))
+        return self.output(h)
+
+    def forward(self, left_padded, right_padded, left_lens, right_lens):
+        """Forward pass with packed sequences for efficient training.
+
+        Args:
+            left_padded:  (batch, max_L) int tensor
+            right_padded: (batch, max_R) int tensor
+            left_lens:  (batch,) int tensor of actual lengths
+            right_lens: (batch,) int tensor of actual lengths
+
+        Returns:
+            logits: (batch, vocab_size)
+        """
+        left_emb = self.embedding(left_padded)
+        right_emb = self.embedding(right_padded)
+
+        # Reverse right context for right-to-left processing
+        # Use index_select for vectorized reversal of valid portions
+        batch_size, max_R, edim = right_emb.shape
+        # Build reversed indices: for each row, reverse [0..rlen-1] within padding
+        idx = torch.arange(max_R, device=right_emb.device).unsqueeze(0).expand(batch_size, -1)
+        rlens = right_lens.unsqueeze(1)  # (batch, 1)
+        # reversed index: rlen-1-i for i < rlen, else 0 (padding, will be masked)
+        rev_idx = (rlens - 1 - idx).clamp(min=0)
+        right_emb_rev = right_emb.gather(1, rev_idx.unsqueeze(-1).expand(-1, -1, edim))
+
+        # Pack sequences
+        left_packed = nn.utils.rnn.pack_padded_sequence(
+            left_emb, left_lens.cpu(), batch_first=True, enforce_sorted=False)
+        right_packed = nn.utils.rnn.pack_padded_sequence(
+            right_emb_rev, right_lens.cpu(), batch_first=True, enforce_sorted=False)
+
+        _, h_L = self.left_gru(left_packed)
+        _, h_R = self.right_gru(right_packed)
+
+        h_L = h_L[-1]  # (batch, gru_dim)
+        h_R = h_R[-1]
+
+        combined = torch.cat([h_L, h_R], dim=-1)
+        h = torch.relu(self.hidden(combined))
+        return self.output(h)
+
+
+def train_rnn_cloze_model(sentences, embedding_dim=64, hidden_dim=128,
+                          gru_dim=128, n_gru_layers=1,
+                          n_epochs=5, batch_size=512, lr=1e-3,
+                          min_count=1, seed=42, verbose=True, device=None,
+                          gap=0, word2idx=None, idx2word=None):
+    """Train an RNN cloze model on the given sentences.
+
+    Args:
+        gap: number of words to skip on the right side of context.
+             gap=0 is the normal model; gap=1 is the gap model for
+             pair prediction.
+        word2idx, idx2word: if provided, reuse this vocabulary instead
+             of building a new one (useful when training gap model to
+             share vocab with normal model).
+
+    Returns:
+        model, word2idx, idx2word, history
+    """
+    if device is None:
+        device = torch.device('mps' if torch.backends.mps.is_available()
+                              else 'cuda' if torch.cuda.is_available()
+                              else 'cpu')
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    if word2idx is None:
+        if verbose:
+            print(f"Building vocabulary (min_count={min_count})...", flush=True)
+        word2idx, idx2word = build_vocab(sentences, min_count=min_count)
+    vocab_size = len(word2idx)
+    if verbose:
+        print(f"  Vocabulary size: {vocab_size}", flush=True)
+
+    gap_label = f" (gap={gap})" if gap > 0 else ""
+    if verbose:
+        print(f"Extracting variable-length contexts{gap_label}...", flush=True)
+    t0 = time.time()
+    dataset = RNNClozeDataset(sentences, word2idx, gap=gap)
+    if verbose:
+        print(f"  {len(dataset)} training examples ({time.time()-t0:.1f}s)", flush=True)
+
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                            num_workers=0, pin_memory=False,
+                            collate_fn=rnn_collate_fn)
+
+    model = RNNClozeModel(vocab_size, embedding_dim, hidden_dim,
+                          gru_dim, n_gru_layers, gap=gap).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    if verbose:
+        n_params = sum(p.numel() for p in model.parameters())
+        label = "RNNClozeModel" + (f" [gap={gap}]" if gap > 0 else "")
+        print(f"{label}: {n_params:,} parameters, device={device}", flush=True)
+        print(f"  embedding={embedding_dim}, gru={gru_dim}x{n_gru_layers}, "
+              f"hidden={hidden_dim}", flush=True)
+        print(f"Training for {n_epochs} epochs...", flush=True)
+
+    history = {'epoch_loss': [], 'batch_losses': []}
+
+    for epoch in range(n_epochs):
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        t0 = time.time()
+
+        for left_pad, right_pad, left_lens, right_lens, targets in dataloader:
+            left_pad = left_pad.to(device)
+            right_pad = right_pad.to(device)
+            left_lens = left_lens.to(device)
+            right_lens = right_lens.to(device)
+            targets = targets.to(device)
+
+            optimizer.zero_grad()
+            logits = model(left_pad, right_pad, left_lens, right_lens)
+            loss = criterion(logits, targets)
+            loss.backward()
+            optimizer.step()
+
+            batch_loss = loss.item()
+            total_loss += batch_loss
+            n_batches += 1
+            history['batch_losses'].append(batch_loss)
+
+        avg_loss = total_loss / n_batches
+        history['epoch_loss'].append(avg_loss)
+        elapsed = time.time() - t0
+
+        if verbose:
+            ppl = np.exp(avg_loss)
+            print(f"  Epoch {epoch+1}/{n_epochs}: "
+                  f"loss={avg_loss:.4f}, ppl={ppl:.1f}, "
+                  f"time={elapsed:.1f}s", flush=True)
+
+    model.eval()
+    return model, word2idx, idx2word, history
+
+
 def save_model(model, word2idx, idx2word, path, k=2, history=None):
     """Save trained model and vocabulary to disk.
 
@@ -783,7 +1102,9 @@ def save_model(model, word2idx, idx2word, path, k=2, history=None):
         k: context window size used during training
         history: training history dict (optional)
     """
-    if isinstance(model, PositionalPairClozeModel):
+    if isinstance(model, RNNClozeModel):
+        model_type = 'rnn_single'
+    elif isinstance(model, PositionalPairClozeModel):
         model_type = 'positional_pair'
     elif isinstance(model, PositionalClozeModel):
         model_type = 'positional_single'
@@ -804,6 +1125,11 @@ def save_model(model, word2idx, idx2word, path, k=2, history=None):
     }
     if hasattr(model, 'n_context'):
         checkpoint['n_context'] = model.n_context
+    if hasattr(model, 'gru_dim'):
+        checkpoint['gru_dim'] = model.gru_dim
+        checkpoint['n_gru_layers'] = model.n_gru_layers
+    if hasattr(model, 'gap'):
+        checkpoint['gap'] = model.gap
     if history is not None:
         checkpoint['history'] = history
     torch.save(checkpoint, path)
@@ -831,7 +1157,16 @@ def load_model(path, device=None):
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     model_type = checkpoint.get('model_type', 'single')
 
-    if model_type == 'positional_pair':
+    if model_type == 'rnn_single':
+        model = RNNClozeModel(
+            checkpoint['vocab_size'],
+            checkpoint['embedding_dim'],
+            checkpoint['hidden_dim'],
+            checkpoint.get('gru_dim', 128),
+            checkpoint.get('n_gru_layers', 1),
+            gap=checkpoint.get('gap', 0),
+        ).to(device)
+    elif model_type == 'positional_pair':
         model = PositionalPairClozeModel(
             checkpoint['vocab_size'],
             checkpoint['n_context'],

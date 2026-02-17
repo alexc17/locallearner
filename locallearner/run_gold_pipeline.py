@@ -60,7 +60,8 @@ def get_gold_kernels(grammar):
 
 
 def run_pipeline(grammar_id, base_dir=DEFAULT_BASE, maxlength=15, maxcount=1000,
-                 stepsize=0.5, n_corpus=100000, k=2, model_type='bow'):
+                 stepsize=0.5, n_corpus=100000, k=2, model_type='bow',
+                 n_epochs=10):
     """Run full pipeline for one grammar. Returns dict of results."""
     gdir = os.path.join(base_dir, grammar_id)
     grammar_path = os.path.join(gdir, 'grammar.pcfg')
@@ -72,7 +73,7 @@ def run_pipeline(grammar_id, base_dir=DEFAULT_BASE, maxlength=15, maxcount=1000,
         raise FileNotFoundError(f"Corpus not found: {corpus_path}")
 
     target = wcfg.load_wcfg_from_file(grammar_path)
-    mt_tag = 'pos' if model_type == 'positional' else 'bow'
+    mt_tag = {'positional': 'pos', 'rnn': 'rnn', 'bow': 'bow'}[model_type]
     print(f"[{grammar_id}] Target: {len(target.nonterminals)} NTs, "
           f"{len(target.terminals)} terminals, k={k}, model={mt_tag}")
 
@@ -85,9 +86,14 @@ def run_pipeline(grammar_id, base_dir=DEFAULT_BASE, maxlength=15, maxcount=1000,
     nl = nl_module.NeuralLearner(corpus_path)
     nl.k = k
     nl.model_type = model_type
-    # Use distinct filenames for positional vs bow models
-    prefix = f'{mt_tag}_' if model_type == 'positional' else ''
-    nl.single_model_file = os.path.join(gdir, f'{prefix}cloze_k{k}.pt')
+    nl.n_epochs = n_epochs
+    # Use distinct filenames for each model type
+    prefix = f'{mt_tag}_' if model_type in ('positional', 'rnn') else ''
+    if model_type == 'rnn':
+        nl.single_model_file = os.path.join(gdir, f'{prefix}cloze.pt')
+        nl.gap_model_file = os.path.join(gdir, f'{prefix}gap_cloze.pt')
+    else:
+        nl.single_model_file = os.path.join(gdir, f'{prefix}cloze_k{k}.pt')
     nl.pair_model_file = os.path.join(gdir, f'{prefix}pair_cloze_k{k}.pt')
 
     nl.train_single_model(verbose=False)
@@ -207,14 +213,17 @@ def main():
     parser.add_argument('--corpus_size', type=int, default=100000)
     parser.add_argument('--k', type=int, default=2, help='Context width for neural models')
     parser.add_argument('--model_type', type=str, default='bow',
-                        choices=['bow', 'positional'],
-                        help='Neural model type: bow (bag-of-words) or positional')
+                        choices=['bow', 'positional', 'rnn'],
+                        help='Neural model type: bow, positional, or rnn')
+    parser.add_argument('--n_epochs', type=int, default=10,
+                        help='Number of training epochs for neural models')
     args = parser.parse_args()
 
     run_pipeline(args.grammar_id, args.base,
                  maxlength=args.maxlength, maxcount=args.maxcount,
                  stepsize=args.stepsize, n_corpus=args.corpus_size,
-                 k=args.k, model_type=args.model_type)
+                 k=args.k, model_type=args.model_type,
+                 n_epochs=args.n_epochs)
 
 
 if __name__ == '__main__':

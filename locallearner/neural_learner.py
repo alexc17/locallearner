@@ -27,6 +27,7 @@ import nmf as nmf_module
 from neural_features import (
     ClozeModel, PairClozeModel, ClozeDataset, PairClozeDataset,
     PositionalClozeModel, PositionalPairClozeModel,
+    RNNClozeModel, train_rnn_cloze_model,
     build_vocab, train_cloze_model, train_pair_cloze_model,
     train_positional_cloze_model, train_positional_pair_cloze_model,
     save_model, load_model, load_sentences, save_kernels, load_kernels,
@@ -98,6 +99,7 @@ class NeuralLearner:
         self.bigram_file = None
         self.single_model_file = None
         self.pair_model_file = None
+        self.gap_model_file = None    # RNN gap model cache path
         self.kernels_file = None
 
         # State (populated during learning)
@@ -105,6 +107,7 @@ class NeuralLearner:
         self.candidate_kernels = None # overshot kernel list from NMF
         self.single_model = None      # trained ClozeModel
         self.pair_model = None        # trained PairClozeModel
+        self.gap_model = None         # RNN gap model (gap=1) for pair prediction
         self.w2i = None               # word -> index for neural models
         self.i2w = None               # index -> word for neural models
         self.anchors = None           # list of selected anchor words (excl S)
@@ -247,17 +250,28 @@ class NeuralLearner:
 
         if verbose:
             mt = self.model_type
-            print(f"Training single cloze model ({mt}, k={self.k}, "
+            k_str = 'variable' if mt == 'rnn' else str(self.k)
+            print(f"Training single cloze model ({mt}, k={k_str}, "
                   f"{self.n_epochs} epochs)...")
 
-        train_fn = (train_positional_cloze_model if self.model_type == 'positional'
-                    else train_cloze_model)
-        model, w2i, i2w, history = train_fn(
-            self.sentences, k=self.k,
-            embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
-            n_epochs=self.n_epochs, batch_size=self.batch_size,
-            lr=1e-3, min_count=1, seed=self.seed, verbose=verbose,
-        )
+        if self.model_type == 'rnn':
+            model, w2i, i2w, history = train_rnn_cloze_model(
+                self.sentences,
+                embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                gru_dim=self.hidden_dim,
+                n_epochs=self.n_epochs, batch_size=self.batch_size,
+                lr=1e-3, min_count=1, seed=self.seed, verbose=verbose,
+            )
+        else:
+            train_fn = (train_positional_cloze_model
+                        if self.model_type == 'positional'
+                        else train_cloze_model)
+            model, w2i, i2w, history = train_fn(
+                self.sentences, k=self.k,
+                embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+                n_epochs=self.n_epochs, batch_size=self.batch_size,
+                lr=1e-3, min_count=1, seed=self.seed, verbose=verbose,
+            )
         # Move to CPU for inference (training may use MPS/CUDA)
         model = model.cpu()
         self.single_model = model
@@ -269,7 +283,16 @@ class NeuralLearner:
                        k=self.k, history=history)
 
     def train_pair_model(self, verbose=True):
-        """Train pair cloze model P(w1, w2 | context)."""
+        """Train pair cloze model P(w1, w2 | context).
+
+        For RNN model_type, trains a gap model (gap=1) instead of a
+        separate pair architecture. The gap model is an RNNClozeModel
+        with the same architecture as the normal model but trained on
+        contexts where the right side skips one word.
+        """
+        if self.model_type == 'rnn':
+            return self._train_gap_model(verbose=verbose)
+
         if self.pair_model_file and os.path.exists(self.pair_model_file):
             result = load_model(self.pair_model_file, device='cpu')
             self.pair_model = result[0]
@@ -302,6 +325,39 @@ class NeuralLearner:
         if self.pair_model_file:
             save_model(model, w2i, i2w, self.pair_model_file,
                        k=self.k, history=history)
+
+    def _train_gap_model(self, verbose=True):
+        """Train RNN gap model (gap=1) for pair prediction.
+
+        Uses the same vocabulary as the normal RNN model.
+        """
+        if self.gap_model_file and os.path.exists(self.gap_model_file):
+            result = load_model(self.gap_model_file, device='cpu')
+            self.gap_model = result[0]
+            if verbose:
+                print(f"Loaded gap model from {self.gap_model_file}")
+            return
+
+        assert self.w2i is not None, "Train single model first"
+
+        if verbose:
+            print(f"Training RNN gap model (gap=1, "
+                  f"{self.n_epochs} epochs)...")
+
+        model, w2i, i2w, history = train_rnn_cloze_model(
+            self.sentences,
+            embedding_dim=self.embedding_dim, hidden_dim=self.hidden_dim,
+            gru_dim=self.hidden_dim,
+            n_epochs=self.n_epochs, batch_size=self.batch_size,
+            lr=1e-3, min_count=1, seed=self.seed, verbose=verbose,
+            gap=1, word2idx=self.w2i, idx2word=self.i2w,
+        )
+        model = model.cpu()
+        self.gap_model = model
+
+        if self.gap_model_file:
+            save_model(model, w2i, i2w, self.gap_model_file,
+                       k=0, history=history)
 
     # ==========================================================
     # Step 3: Select anchors using Rényi divergences
@@ -486,16 +542,28 @@ class NeuralLearner:
                   f"tau_high={tau_high})...")
 
         # --- 2. Collect contexts for all terminals in one corpus pass ---
+        is_rnn = self._is_rnn_model()
         terminal_set = set(terminals)
         terminal_ctxs = {w: Counter() for w in terminals}
 
-        for sent in self.sentences:
-            padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
-            for i in range(k, len(padded) - k):
-                w = padded[i]
-                if w in terminal_set:
-                    ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
-                    terminal_ctxs[w][ctx] += 1
+        if is_rnn:
+            for sent in self.sentences:
+                words = list(sent)
+                n = len(words)
+                for i in range(n):
+                    w = words[i]
+                    if w in terminal_set:
+                        left = tuple([BOUNDARY] + words[:i])
+                        right = tuple(words[i + 1:] + [BOUNDARY])
+                        terminal_ctxs[w][(left, right)] += 1
+        else:
+            for sent in self.sentences:
+                padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
+                for i in range(k, len(padded) - k):
+                    w = padded[i]
+                    if w in terminal_set:
+                        ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
+                        terminal_ctxs[w][ctx] += 1
 
         # --- 3. Precompute neural log-probs per terminal ---
         terminal_log_p = {}  # word -> (log_p_matrix, weights)
@@ -513,23 +581,44 @@ class NeuralLearner:
             counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
             weights = counts / counts.sum()
 
-            ctx_tensor = torch.zeros(len(ctx_list), 2 * k, dtype=torch.long)
-            for ci, ctx in enumerate(ctx_list):
-                for j, cw in enumerate(ctx):
-                    ctx_tensor[ci, j] = self.w2i.get(cw, 0)
-
             with torch.no_grad():
-                logits = self.single_model(ctx_tensor)
-                log_p = torch.log_softmax(logits, dim=-1).numpy()
+                if is_rnn:
+                    log_p_list = []
+                    for left_words, right_words in ctx_list:
+                        left_t = torch.tensor(
+                            [self.w2i.get(cw, 0) for cw in left_words],
+                            dtype=torch.long).unsqueeze(0)
+                        right_t = torch.tensor(
+                            [self.w2i.get(cw, 0) for cw in right_words],
+                            dtype=torch.long).unsqueeze(0)
+                        logits = self.single_model.forward_unpacked(
+                            left_t, right_t)
+                        log_p_list.append(
+                            torch.log_softmax(logits, dim=-1)[0].numpy())
+                    log_p = np.stack(log_p_list)
+                else:
+                    ctx_tensor = torch.zeros(
+                        len(ctx_list), 2 * k, dtype=torch.long)
+                    for ci, ctx in enumerate(ctx_list):
+                        for j, cw in enumerate(ctx):
+                            ctx_tensor[ci, j] = self.w2i.get(cw, 0)
+                    logits = self.single_model(ctx_tensor)
+                    log_p = torch.log_softmax(logits, dim=-1).numpy()
 
             terminal_log_p[w] = (log_p, weights)
 
         # --- 4. Synthetic S terminal: boundary-only context ---
         bdy_id = self.w2i[BOUNDARY]
-        s_ctx = torch.zeros(1, 2 * k, dtype=torch.long)
-        s_ctx[:, :] = bdy_id
         with torch.no_grad():
-            s_logits = self.single_model(s_ctx)
+            if is_rnn:
+                bdy_left = torch.tensor([[bdy_id]], dtype=torch.long)
+                bdy_right = torch.tensor([[bdy_id]], dtype=torch.long)
+                s_logits = self.single_model.forward_unpacked(
+                    bdy_left, bdy_right)
+            else:
+                s_ctx = torch.zeros(1, 2 * k, dtype=torch.long)
+                s_ctx[:, :] = bdy_id
+                s_logits = self.single_model(s_ctx)
             s_log_p = torch.log_softmax(s_logits, dim=-1).numpy()
         s_weights = np.array([1.0])
         terminal_log_p['<S>'] = (s_log_p, s_weights)
@@ -700,20 +789,42 @@ class NeuralLearner:
     # Step 4: Estimate xi parameters
     # ==========================================================
 
+    def _is_rnn_model(self):
+        """Check if the single model is an RNN model."""
+        return isinstance(self.single_model, RNNClozeModel)
+
     def _collect_anchor_contexts(self):
-        """Collect single-word contexts for each anchor, with counts."""
-        k = self.k
+        """Collect single-word contexts for each anchor, with counts.
+
+        For RNN models, collects variable-length (left, right) contexts.
+        For fixed-width models, collects fixed-width context tuples.
+        Also always collects fixed-width contexts for binary xi estimation
+        (which uses the fixed-width pair model).
+        """
         self._anchor_ctxs = {}
         for a in self.anchors:
             self._anchor_ctxs[a] = Counter()
 
-        for sent in self.sentences:
-            padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
-            for i in range(k, len(padded) - k):
-                w = padded[i]
-                if w in self._anchor_ctxs:
-                    ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
-                    self._anchor_ctxs[w][ctx] += 1
+        if self._is_rnn_model():
+            # Variable-length contexts for RNN single model
+            for sent in self.sentences:
+                words = list(sent)
+                n = len(words)
+                for i in range(n):
+                    w = words[i]
+                    if w in self._anchor_ctxs:
+                        left = tuple([BOUNDARY] + words[:i])
+                        right = tuple(words[i + 1:] + [BOUNDARY])
+                        self._anchor_ctxs[w][(left, right)] += 1
+        else:
+            k = self.k
+            for sent in self.sentences:
+                padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
+                for i in range(k, len(padded) - k):
+                    w = padded[i]
+                    if w in self._anchor_ctxs:
+                        ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
+                        self._anchor_ctxs[w][ctx] += 1
 
     def _get_filtered_contexts(self, anchor):
         """Get contexts for an anchor, filtered by frequency."""
@@ -811,6 +922,46 @@ class NeuralLearner:
         lse = max_s + np.log(np.sum(weights * np.exp(scaled - max_s)))
         return float(lse / (alpha - 1))
 
+    def _compute_full_log_probs(self, anchor):
+        """Compute full (n_ctx, vocab) log-prob matrix for an anchor's contexts.
+
+        Handles both fixed-width and RNN models.
+
+        Returns:
+            (log_p, weights): log_p is (n_ctx, vocab) numpy array,
+                              weights is (n_ctx,) numpy array.
+        """
+        freq = self._get_filtered_contexts(anchor)
+        ctx_list = list(freq.keys())
+        counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
+        weights = counts / counts.sum()
+
+        with torch.no_grad():
+            if self._is_rnn_model():
+                log_p_list = []
+                for left_words, right_words in ctx_list:
+                    left_t = torch.tensor(
+                        [self.w2i.get(w, 0) for w in left_words],
+                        dtype=torch.long).unsqueeze(0)
+                    right_t = torch.tensor(
+                        [self.w2i.get(w, 0) for w in right_words],
+                        dtype=torch.long).unsqueeze(0)
+                    logits = self.single_model.forward_unpacked(left_t, right_t)
+                    log_p_list.append(
+                        torch.log_softmax(logits, dim=-1)[0].numpy())
+                log_p = np.stack(log_p_list)
+            else:
+                k = self.k
+                n_ctx = len(ctx_list)
+                ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
+                for ci, ctx in enumerate(ctx_list):
+                    for j, w in enumerate(ctx):
+                        ctx_tensor[ci, j] = self.w2i.get(w, 0)
+                logits = self.single_model(ctx_tensor)
+                log_p = torch.log_softmax(logits, dim=-1).numpy()
+
+        return log_p, weights
+
     def estimate_lexical_xi(self, verbose=True):
         """Estimate xi(A -> b) for all anchors A and terminals b.
 
@@ -827,7 +978,6 @@ class NeuralLearner:
 
         self._collect_anchor_contexts()
 
-        k = self.k
         self.lexical_xi = {}
 
         for anchor in self.anchors:
@@ -835,20 +985,7 @@ class NeuralLearner:
             a_vid = self.w2i[anchor]
             log_E_a = math.log(self.E_sent[anchor])
 
-            freq = self._get_filtered_contexts(anchor)
-            ctx_list = list(freq.keys())
-            counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
-            weights = counts / counts.sum()
-            n_ctx = len(ctx_list)
-
-            ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
-            for ci, ctx in enumerate(ctx_list):
-                for j, w in enumerate(ctx):
-                    ctx_tensor[ci, j] = self.w2i.get(w, 0)
-
-            with torch.no_grad():
-                logits = self.single_model(ctx_tensor)
-                log_p = torch.log_softmax(logits, dim=-1).numpy()
+            log_p, weights = self._compute_full_log_probs(anchor)
 
             for b in self.vocab:
                 if b not in self.w2i:
@@ -891,21 +1028,40 @@ class NeuralLearner:
     def _prepare_anchor_contexts(self, anchor):
         """Prepare context tensors, weights, and gap corrections for an anchor.
 
-        Returns:
+        For fixed-width models returns:
             (ctx_tensor, weights, n_ctx, gap_corrections):
             - ctx_tensor: (n_ctx, 2*k) long tensor of context word indices
             - weights: normalised context weights
             - n_ctx: number of contexts
             - gap_corrections: numpy array of per-context log(P(1-gap)/P(2-gap)),
               or None if _collect_gap_counts has not been called.
+
+        For RNN models returns:
+            (ctx_data, weights, n_ctx, gap_corrections):
+            - ctx_data: list of (left_tensor, right_tensor) pairs
+            - weights: normalised context weights
+            - n_ctx: number of contexts
+            - gap_corrections: always None (gap correction not used with RNN)
         """
-        k = self.k
         freq = self._get_filtered_contexts(anchor)
         ctx_list = list(freq.keys())
         counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
         weights = counts / counts.sum()
         n_ctx = len(ctx_list)
 
+        if self._is_rnn_model():
+            ctx_data = []
+            for left_words, right_words in ctx_list:
+                left_ids = torch.tensor(
+                    [self.w2i.get(w, 0) for w in left_words],
+                    dtype=torch.long).unsqueeze(0)
+                right_ids = torch.tensor(
+                    [self.w2i.get(w, 0) for w in right_words],
+                    dtype=torch.long).unsqueeze(0)
+                ctx_data.append((left_ids, right_ids))
+            return ctx_data, weights, n_ctx, None
+
+        k = self.k
         ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
         for ci, ctx in enumerate(ctx_list):
             for j, w in enumerate(ctx):
@@ -919,16 +1075,29 @@ class NeuralLearner:
 
         return ctx_tensor, weights, n_ctx, gap_corrections
 
-    def _single_model_log_probs(self, ctx_tensor, word_vid):
+    def _single_model_log_probs(self, ctx_data, word_vid):
         """Compute log P(word | ctx) for each context using the single model.
+
+        Args:
+            ctx_data: for fixed-width models, a (n_ctx, 2*k) tensor;
+                      for RNN, a list of (left_tensor, right_tensor) pairs.
+            word_vid: vocabulary index of the target word.
 
         Returns:
             numpy array of shape (n_ctx,).
         """
         with torch.no_grad():
-            logits = self.single_model(ctx_tensor)
-            log_p = torch.log_softmax(logits, dim=-1)[:, word_vid].numpy()
-        return log_p
+            if self._is_rnn_model():
+                log_probs = []
+                for left_t, right_t in ctx_data:
+                    logits = self.single_model.forward_unpacked(left_t, right_t)
+                    lp = torch.log_softmax(logits, dim=-1)[0, word_vid].item()
+                    log_probs.append(lp)
+                return np.array(log_probs)
+            else:
+                logits = self.single_model(ctx_data)
+                log_p = torch.log_softmax(logits, dim=-1)[:, word_vid].numpy()
+                return log_p
 
     def _pair_model_log_probs(self, ctx_tensor, b_vid, c_vid):
         """Compute log P(b, c | ctx) = log P(b|ctx) + log P(c|ctx, b)
@@ -1009,9 +1178,18 @@ class NeuralLearner:
 
         xi(A -> BC) = exp(PMI(b,c)) * exp(-D_alpha(a || bc))
         where PMI(b,c) = log E(bc) - log E(b) - log E(c)
-        and D_alpha uses the single model for P(a|ctx) and pair model
-        for P(bc|ctx), with a per-context gap correction.
+
+        For fixed-width models:
+            D_alpha uses single model for P(a|ctx) and pair model for
+            P(bc|ctx), with a per-context gap correction.
+
+        For RNN models:
+            P(bc|l,r) = P(b|l,r;gap_model) * P(c|l·b,r;normal_model)
+            No gap correction needed.
         """
+        if self._is_rnn_model():
+            return self._estimate_nonS_binary_xi_rnn()
+
         for anchor_A in self.anchors:
             nt_A = self.anchor2nt[anchor_A]
             a_vid = self.w2i[anchor_A]
@@ -1045,6 +1223,82 @@ class NeuralLearner:
                     xi = math.exp(pmi - d)
                     self.binary_xi[(nt_A, nt_B, nt_C)] = xi
 
+    def _rnn_pair_log_probs(self, ctx_data, b_vid, c_vid):
+        """Compute log P(b,c | l,r) for RNN models.
+
+        P(b,c|l,r) = P(b|l,r;gap_model) * P(c|l·b,r;normal_model)
+
+        Args:
+            ctx_data: list of (left_tensor, right_tensor) pairs,
+                      where left/right are variable-length.
+            b_vid: vocab index of first word (b)
+            c_vid: vocab index of second word (c)
+
+        Returns:
+            numpy array of shape (n_ctx,) with log P(b,c|l,r).
+        """
+        log_probs = []
+        b_id_tensor = torch.tensor([b_vid], dtype=torch.long)
+        with torch.no_grad():
+            for left_t, right_t in ctx_data:
+                # P(b | l, r) using gap model
+                logits_b = self.gap_model.forward_unpacked(left_t, right_t)
+                log_p_b = torch.log_softmax(
+                    logits_b, dim=-1)[0, b_vid].item()
+
+                # P(c | l·b, r) using normal model
+                # Append b to left context
+                left_with_b = torch.cat([left_t, b_id_tensor.unsqueeze(0)],
+                                        dim=1)
+                logits_c = self.single_model.forward_unpacked(
+                    left_with_b, right_t)
+                log_p_c = torch.log_softmax(
+                    logits_c, dim=-1)[0, c_vid].item()
+
+                log_probs.append(log_p_b + log_p_c)
+        return np.array(log_probs)
+
+    def _estimate_nonS_binary_xi_rnn(self):
+        """RNN version of non-S binary xi estimation.
+
+        Uses gap model for P(b|l,r) and normal model for P(c|l·b,r).
+        No gap correction needed since each model was trained on its
+        respective context distribution.
+        """
+        for anchor_A in self.anchors:
+            nt_A = self.anchor2nt[anchor_A]
+            a_vid = self.w2i[anchor_A]
+            log_E_a = math.log(self.E_sent[anchor_A])
+
+            # Variable-length contexts for anchor A
+            ctx_data, weights, n_ctx, _ = (
+                self._prepare_anchor_contexts(anchor_A))
+            log_p_a = self._single_model_log_probs(ctx_data, a_vid)
+
+            for anchor_B in self.anchors:
+                nt_B = self.anchor2nt[anchor_B]
+                b_vid = self.w2i[anchor_B]
+
+                for anchor_C in self.anchors:
+                    nt_C = self.anchor2nt[anchor_C]
+                    c_vid = self.w2i[anchor_C]
+
+                    pmi, e_bc = self._compute_pmi(anchor_B, anchor_C)
+                    if pmi is None:
+                        self.binary_xi[(nt_A, nt_B, nt_C)] = 0
+                        continue
+
+                    log_E_bc = math.log(e_bc)
+                    log_p_bc = self._rnn_pair_log_probs(
+                        ctx_data, b_vid, c_vid)
+
+                    d = self._binary_divergence(
+                        log_p_a, log_E_a, log_p_bc, log_E_bc,
+                        weights, gap_corrections=None)
+
+                    xi = math.exp(pmi - d)
+                    self.binary_xi[(nt_A, nt_B, nt_C)] = xi
+
     def estimate_binary_xi(self, verbose=True):
         """Estimate xi(A -> BC) for all triples of NTs.
 
@@ -1058,7 +1312,10 @@ class NeuralLearner:
             dict mapping (nt_A, nt_B, nt_C) -> xi value
         """
         assert self.single_model is not None
-        assert self.pair_model is not None
+        if self._is_rnn_model():
+            assert self.gap_model is not None, "Train gap model first"
+        else:
+            assert self.pair_model is not None
         assert self.anchors is not None
 
         if verbose:
@@ -1067,7 +1324,8 @@ class NeuralLearner:
         if not hasattr(self, '_anchor_ctxs'):
             self._collect_anchor_contexts()
 
-        self._collect_gap_counts(verbose=verbose)
+        if not self._is_rnn_model():
+            self._collect_gap_counts(verbose=verbose)
 
         self.binary_xi = {}
 
