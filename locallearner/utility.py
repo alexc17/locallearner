@@ -326,7 +326,7 @@ def strongly_connected_components(graph):
 			component = tuple(connected_component)
 			# storing the result
 			result.append(component)
-	for node in graph:
+	for node in list(graph):
 		if node not in lowlinks:
 			strongconnect(node)
 	return result

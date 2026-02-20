@@ -1,0 +1,153 @@
+
+# Neural pipeline experiments.
+#
+# All parameters live in a JSON config file.  The Makefile handles
+# only the dependency graph and parallelism.
+#
+# Usage:
+#   make -f Makefile.neural -j 10 all              # full pipeline
+#   make -f Makefile.neural -j 10 corpus            # sample trees + extract yields
+#   make -f Makefile.neural -j 10 rnn_models        # train RNN models
+#   make -f Makefile.neural -j 10 pos_models        # train positional models
+#   make -f Makefile.neural -j 10 models            # train both
+#   make -f Makefile.neural -j 10 kernels           # kernel finding only
+#   make -f Makefile.neural config=myconfig.json all # custom config
+#   make -f Makefile.neural clean
+
+config = config.json
+srcdir = ../locallearner
+
+# Extract values the Makefile needs from the config file.
+basedir      = $(shell python -c "import json; print(json.load(open('$(config)'))['basedir'])")
+pos_k        = $(shell python -c "import json; print(json.load(open('$(config)')).get('pipeline',{}).get('pos_k', 2))")
+corpus_n     = $(shell python -c "import json; print(json.load(open('$(config)')).get('corpus',{}).get('n_sentences', 1000000))")
+corpus_seed  = $(shell python -c "import json; print(json.load(open('$(config)')).get('corpus',{}).get('seed', 1))")
+ml_maxlength = $(shell python -c "import json; print(json.load(open('$(config)')).get('pipeline',{}).get('ml_maxlength', 10))")
+
+grammars = $(sort $(notdir $(wildcard $(basedir)/g???)))
+
+# ============================================================
+# Step 0: Sample trees, extract yields, build ML grammar
+# ============================================================
+
+# Sample trees from grammar (full derivations, no probabilities)
+$(basedir)/%/trees : $(basedir)/%/grammar.pcfg
+	python $(srcdir)/sample_corpus.py \
+		--omitprobs --seed $(corpus_seed) --n $(corpus_n) \
+		$< $@ > $(basedir)/$*/sample.log 2>&1
+
+# Extract string yields from trees
+$(basedir)/%/corpus.txt : $(basedir)/%/trees
+	python $(srcdir)/convert_trees_to_yields.py \
+		$< $@ >> $(basedir)/$*/sample.log 2>&1
+
+# Maximum-likelihood PCFG from the sampled trees
+$(basedir)/%/ml.pcfg : $(basedir)/%/trees
+	python $(srcdir)/convert_trees_to_pcfg.py \
+		--length $(ml_maxlength) \
+		$< $@ >> $(basedir)/$*/sample.log 2>&1
+
+corpus : $(foreach g,$(grammars),$(basedir)/$(g)/corpus.txt $(basedir)/$(g)/ml.pcfg)
+	@echo "Corpora and ML grammars ready for $(words $(grammars)) grammars."
+
+# ============================================================
+# Step 1: Train cloze models
+# ============================================================
+
+# RNN models (single + gap)
+$(basedir)/%/.rnn_trained : $(basedir)/%/corpus.txt $(config)
+	python $(srcdir)/train_cloze_models.py \
+		$(basedir)/$* --config $(config) --model_type rnn \
+		> $(basedir)/$*/train_rnn.log 2>&1
+	@touch $@
+
+$(basedir)/%/rnn_cloze.pt : $(basedir)/%/.rnn_trained
+	@test -f $@ || (echo "ERROR: $@ not produced" && false)
+
+rnn_models : $(foreach g,$(grammars),$(basedir)/$(g)/.rnn_trained)
+	@echo "RNN models trained for $(words $(grammars)) grammars."
+
+# Positional models (single + pair)
+$(basedir)/%/.pos_k$(pos_k)_trained : $(basedir)/%/corpus.txt $(config)
+	python $(srcdir)/train_cloze_models.py \
+		$(basedir)/$* --config $(config) --model_type positional \
+		> $(basedir)/$*/train_pos_k$(pos_k).log 2>&1
+	@touch $@
+
+$(basedir)/%/pos_cloze_k$(pos_k).pt : $(basedir)/%/.pos_k$(pos_k)_trained
+	@test -f $@ || (echo "ERROR: $@ not produced" && false)
+
+pos_models : $(foreach g,$(grammars),$(basedir)/$(g)/.pos_k$(pos_k)_trained)
+	@echo "Positional models (k=$(pos_k)) trained for $(words $(grammars)) grammars."
+
+models : rnn_models pos_models
+
+# ============================================================
+# Step 2: Full pipeline (kernels + conditional eval)
+# ============================================================
+
+$(basedir)/%/neural_pipeline_results.json : $(basedir)/%/grammar.pcfg $(basedir)/%/corpus.txt $(basedir)/%/ml.pcfg $(basedir)/%/rnn_cloze.pt $(config)
+	python $(srcdir)/run_neural_pipeline.py \
+		--config $(config) \
+		$* > $(basedir)/$*/neural_pipeline.log 2>&1
+
+all : $(foreach g,$(grammars),$(basedir)/$(g)/neural_pipeline_results.json)
+	@echo ""
+	@echo "=== Summary ==="
+	@for f in $(foreach g,$(grammars),$(basedir)/$(g)/neural_pipeline_results.json); do \
+		if [ -f "$$f" ]; then \
+			g=$$(basename $$(dirname $$f)); \
+			python -c "import json; d=json.load(open('$$f')); \
+				s=d.get('status','?'); nf=d.get('n_found_nts','?'); nt=d.get('n_target_nts','?'); \
+				ml=f\"{d['ml']['labeled_micro']:.4f}\" if 'ml' in d else '-'; \
+				init=f\"{d['init']['labeled_micro']:.4f}\" if 'init' in d else '-'; \
+				sgd=f\"{d['sgd']['labeled_micro']:.4f}\" if 'sgd' in d else '-'; \
+				print(f'  {g}: {nf}/{nt} NTs, {s}, ML={ml} init={init} sgd={sgd}')"; \
+		fi; \
+	done
+
+# Kernels only
+kernels : $(foreach g,$(grammars),$(basedir)/$(g)/.neural_kernels_done)
+
+$(basedir)/%/.neural_kernels_done : $(basedir)/%/grammar.pcfg $(basedir)/%/corpus.txt $(basedir)/%/rnn_cloze.pt $(config)
+	python $(srcdir)/run_neural_pipeline.py \
+		--config $(config) --kernels-only \
+		$* > $(basedir)/$*/neural_kernels.log 2>&1
+	@touch $@
+
+# ============================================================
+# Cleanup
+# ============================================================
+
+clean :
+	rm -f $(basedir)/g???/neural_pipeline_results.json
+	rm -f $(basedir)/g???/.neural_kernels_done
+	rm -f $(basedir)/g???/neural_pipeline.log
+	rm -f $(basedir)/g???/neural_kernels.log
+	rm -f $(basedir)/g???/neural_init.wcfg
+	rm -f $(basedir)/g???/neural_init.pcfg
+	rm -f $(basedir)/g???/neural_sgd.pcfg
+	rm -f $(basedir)/neural_pipeline_summary.json
+
+clean_models :
+	rm -f $(basedir)/g???/rnn_cloze.pt
+	rm -f $(basedir)/g???/rnn_gap_cloze.pt
+	rm -f $(basedir)/g???/.rnn_trained
+	rm -f $(basedir)/g???/pos_cloze_k*.pt
+	rm -f $(basedir)/g???/pos_pair_cloze_k*.pt
+	rm -f $(basedir)/g???/.pos_k*_trained
+	rm -f $(basedir)/g???/train_rnn.log
+	rm -f $(basedir)/g???/train_pos_k*.log
+
+clean_corpus :
+	rm -f $(basedir)/g???/trees
+	rm -f $(basedir)/g???/corpus.txt
+	rm -f $(basedir)/g???/ml.pcfg
+	rm -f $(basedir)/g???/sample.log
+
+clean_all : clean clean_models clean_corpus
+
+.PHONY : all corpus rnn_models pos_models models kernels
+.PHONY : clean clean_models clean_corpus clean_all
+
+.SECONDARY :

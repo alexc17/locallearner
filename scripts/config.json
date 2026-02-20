@@ -1,0 +1,29 @@
+{
+    "basedir": "../tmp/jm_experiment",
+
+    "corpus": {
+        "n_sentences": 1000000,
+        "seed": 1
+    },
+
+    "training": {
+        "n_epochs": 10,
+        "embedding_dim": 64,
+        "hidden_dim": 128,
+        "batch_size": 4096,
+        "seed": 42
+    },
+
+    "pipeline": {
+        "model_type": "rnn",
+        "pos_k": 2,
+        "ml_maxlength": 10,
+        "maxlength": 15,
+        "maxcount": 1000,
+        "stepsize": 0.5,
+        "eval_corpus_size": 100000,
+        "max_terminals": 300,
+        "epsilon": 1.5,
+        "pipeline_epochs": 3
+    }
+}

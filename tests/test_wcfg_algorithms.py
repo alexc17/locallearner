@@ -145,18 +145,15 @@ class TestNonterminalExpectations:
         assert ne['A'] == pytest.approx(2.0)
 
     def test_nonterminal_expectations_recursive(self, ambiguous_pcfg):
-        """Nonterminal expectations with recursive grammar may fail for singular matrix."""
-        # Recursive grammars can lead to singular matrices in the expectation calculation
-        # This is a known limitation of the implementation
+        """Nonterminal expectations raises LinAlgError for critical grammar.
+
+        The ambiguous_pcfg has A -> A A (0.5) | a (0.5), giving a
+        branching number of exactly 1.  The expected number of NT uses
+        is infinite, so (I - T) is singular.
+        """
         import numpy as np
-        try:
-            ne = ambiguous_pcfg.nonterminal_expectations()
-            # If it succeeds, S used once and A is used more due to recursion
-            assert ne['S'] == pytest.approx(1.0)
-            assert ne['A'] > 2.0
-        except np.linalg.LinAlgError:
-            # Singular matrix is expected for some recursive grammars
-            pytest.skip("Recursive grammar leads to singular matrix")
+        with pytest.raises(np.linalg.LinAlgError):
+            ambiguous_pcfg.nonterminal_expectations()
 
 
 class TestProductionExpectations:
@@ -232,30 +229,18 @@ class TestPartitionNonterminals:
 
     def test_partition_simple(self, simple_pcfg):
         """Partition nonterminals of simple grammar."""
-        # Note: partition_nonterminals may have a bug with dictionary iteration
-        # that can cause RuntimeError in some Python versions
-        try:
-            sccs = simple_pcfg.partition_nonterminals()
-            # Non-recursive grammar: each NT in its own SCC
-            assert len(sccs) >= 1
-        except RuntimeError as e:
-            if "dictionary changed size during iteration" in str(e):
-                pytest.skip("Known issue with strongly_connected_components iteration")
-            raise
+        sccs = simple_pcfg.partition_nonterminals()
+        # Non-recursive grammar: each NT in its own SCC
+        assert len(sccs) >= 1
 
     def test_partition_recursive(self, ambiguous_pcfg):
         """Partition nonterminals with recursive grammar."""
-        try:
-            sccs = ambiguous_pcfg.partition_nonterminals()
-            # A -> A A makes A self-recursive
-            # Find the SCC containing A
-            for scc in sccs:
-                if 'A' in scc:
-                    assert len(scc) >= 1
-        except RuntimeError as e:
-            if "dictionary changed size during iteration" in str(e):
-                pytest.skip("Known issue with strongly_connected_components iteration")
-            raise
+        sccs = ambiguous_pcfg.partition_nonterminals()
+        # A -> A A makes A self-recursive
+        # Find the SCC containing A
+        for scc in sccs:
+            if 'A' in scc:
+                assert len(scc) >= 1
 
 
 class TestUnaryInside:

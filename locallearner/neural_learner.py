@@ -86,7 +86,8 @@ class NeuralLearner:
         self.min_count_nmf = None     # min word freq for NMF (auto if None)
         self.n_candidates = 20        # overshot kernel count
         self.alpha = 2.0              # Rényi divergence alpha
-        self.min_context_count = 5    # min context frequency
+        self.min_context_count = 5    # min context frequency (fixed-width)
+        self.n_context_samples = 500  # contexts to sample per word (RNN)
         self.embedding_dim = 64       # neural model embedding dim
         self.hidden_dim = 128         # neural model hidden dim
         self.n_epochs = 10            # training epochs
@@ -501,287 +502,416 @@ class NeuralLearner:
 
         return self.anchors
 
-    def select_anchors_minimal(self, tau_low=0.5, tau_high=1.5,
-                               max_terminals=500, verbose=True):
-        """Select anchors by finding terminals with minimal context
-        distributions, using asymmetric Rényi divergences.
+    # ==========================================================
+    # Context collection and log-prob computation
+    # ==========================================================
 
-        Maintains an antichain of distributionally-minimal terminals.
-        A terminal a is "smaller" than b if D(a||b) < tau_low and
-        D(b||a) > tau_high, meaning a's context support is a subset
-        of b's.
-
-        Processes terminals in decreasing frequency order. The
-        antichain is initialised with a synthetic S terminal whose
-        context distribution is concentrated on the boundary-only
-        context.
+    def _collect_positions(self, word_set):
+        """Collect occurrence positions (sentence_idx, word_idx) for words.
 
         Args:
-            tau_low:  threshold below which divergence indicates
-                      distribution inclusion.
-            tau_high: threshold above which divergence indicates
-                      the reverse direction is not included.
-            max_terminals: only consider the top-N most frequent
-                      terminals.
-            verbose:  print progress trace.
+            word_set: set of words to collect positions for.
+
+        Returns:
+            dict mapping word -> list of (sentence_idx, word_idx).
+        """
+        positions = {w: [] for w in word_set}
+        for si, sent in enumerate(self.sentences):
+            for wi, w in enumerate(sent):
+                if w in positions:
+                    positions[w].append((si, wi))
+        return positions
+
+    def _collect_fixed_contexts(self, word_set):
+        """Collect fixed-width context tuples with counts for words.
+
+        Args:
+            word_set: set of words to collect contexts for.
+
+        Returns:
+            dict mapping word -> Counter of context_tuple -> count.
+        """
+        k = self.k
+        ctxs = {w: Counter() for w in word_set}
+        for sent in self.sentences:
+            padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
+            for i in range(k, len(padded) - k):
+                w = padded[i]
+                if w in ctxs:
+                    ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
+                    ctxs[w][ctx] += 1
+        return ctxs
+
+    def _rnn_log_probs_from_positions(self, positions, n_samples=None,
+                                      rng=None):
+        """Compute (log_p, weights) from occurrence positions using RNN.
+
+        Optionally samples n_samples positions uniformly. Runs the
+        single model on each position's full-sentence context.
+
+        Args:
+            positions: list of (sentence_idx, word_idx).
+            n_samples: max positions to sample (None = use all).
+            rng: numpy RandomState for sampling.
+
+        Returns:
+            (log_p, weights) where log_p is (n_ctx, vocab) and
+            weights is (n_ctx,), or None if no positions.
+        """
+        if not positions:
+            return None
+        if n_samples and len(positions) > n_samples and rng is not None:
+            idx = rng.choice(len(positions), n_samples, replace=False)
+            positions = [positions[i] for i in idx]
+
+        log_p_list = []
+        with torch.no_grad():
+            for si, wi in positions:
+                sent = self.sentences[si]
+                left = [BOUNDARY] + list(sent[:wi])
+                right = list(sent[wi + 1:]) + [BOUNDARY]
+                left_t = torch.tensor(
+                    [self.w2i.get(w, 0) for w in left],
+                    dtype=torch.long).unsqueeze(0)
+                right_t = torch.tensor(
+                    [self.w2i.get(w, 0) for w in right],
+                    dtype=torch.long).unsqueeze(0)
+                logits = self.single_model.forward_unpacked(left_t, right_t)
+                log_p_list.append(
+                    torch.log_softmax(logits, dim=-1)[0].numpy())
+
+        log_p = np.stack(log_p_list)
+        weights = np.ones(len(log_p_list)) / len(log_p_list)
+        return log_p, weights
+
+    def _fixed_log_probs_from_contexts(self, ctx_counter):
+        """Compute (log_p, weights) from a context Counter using fixed-width model.
+
+        Filters by min_context_count, falls back to top-100 if too few pass.
+
+        Args:
+            ctx_counter: Counter mapping context_tuple -> count.
+
+        Returns:
+            (log_p, weights) where log_p is (n_ctx, vocab) and
+            weights is (n_ctx,), or None if no contexts.
+        """
+        freq = {c: n for c, n in ctx_counter.items()
+                if n >= self.min_context_count}
+        if len(freq) < 20:
+            freq = dict(ctx_counter.most_common(100))
+        if not freq:
+            return None
+
+        ctx_list = list(freq.keys())
+        counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
+        weights = counts / counts.sum()
+
+        k = self.k
+        ctx_tensor = torch.zeros(len(ctx_list), 2 * k, dtype=torch.long)
+        for ci, ctx in enumerate(ctx_list):
+            for j, w in enumerate(ctx):
+                ctx_tensor[ci, j] = self.w2i.get(w, 0)
+
+        with torch.no_grad():
+            logits = self.single_model(ctx_tensor)
+            log_p = torch.log_softmax(logits, dim=-1).numpy()
+
+        return log_p, weights
+
+    def _compute_terminal_log_probs(self, words):
+        """Compute per-context log-prob matrices for a list of words.
+
+        For RNN models, samples n_context_samples positions per word.
+        For fixed-width models, collects and filters fixed-width contexts.
+
+        Also adds a synthetic '<S>' entry (boundary-only context).
+
+        Args:
+            words: list of terminal words.
+
+        Returns:
+            dict mapping word -> (log_p, weights) where
+            log_p is (n_ctx, vocab) numpy array and
+            weights is (n_ctx,) numpy array.
+        """
+        word_set = set(words)
+        result = {}
+
+        if self._is_rnn_model():
+            positions = self._collect_positions(word_set)
+            rng = np.random.RandomState(self.seed)
+            for w in words:
+                lp = self._rnn_log_probs_from_positions(
+                    positions[w], n_samples=self.n_context_samples, rng=rng)
+                if lp is not None:
+                    result[w] = lp
+        else:
+            ctxs = self._collect_fixed_contexts(word_set)
+            for w in words:
+                lp = self._fixed_log_probs_from_contexts(ctxs[w])
+                if lp is not None:
+                    result[w] = lp
+
+        # Synthetic S terminal: boundary-only context
+        bdy_id = self.w2i[BOUNDARY]
+        with torch.no_grad():
+            if self._is_rnn_model():
+                bdy_left = torch.tensor([[bdy_id]], dtype=torch.long)
+                bdy_right = torch.tensor([[bdy_id]], dtype=torch.long)
+                s_logits = self.single_model.forward_unpacked(
+                    bdy_left, bdy_right)
+            else:
+                s_ctx = torch.zeros(1, 2 * self.k, dtype=torch.long)
+                s_ctx[:, :] = bdy_id
+                s_logits = self.single_model(s_ctx)
+            s_log_p = torch.log_softmax(s_logits, dim=-1).numpy()
+        result['<S>'] = (s_log_p, np.array([1.0]))
+
+        return result
+
+    # ==========================================================
+    # Subset testing and antichain construction
+    # ==========================================================
+
+    def _violation_fraction(self, terminal_log_p, u, v, epsilon):
+        """Fraction of u's contexts where the subset u ⊆ v is violated.
+
+        For each context c_i of u, computes
+            r_i = log P(v|c_i) - log P(u|c_i) + log E(u) - log E(v)
+        If u ⊆ v, r_i >= 0 everywhere. Returns the fraction where
+        r_i < -epsilon.
+
+        Returns 1.0 if comparison is unavailable.
+        """
+        if u not in terminal_log_p or u == '<S>':
+            return 1.0
+        u_vid = self.w2i.get(u)
+        v_vid = self.w2i.get(v)
+        if u_vid is None or v_vid is None:
+            return 1.0
+
+        log_p, _ = terminal_log_p[u]
+        log_E_u = math.log(self.E_sent[u])
+        log_E_v = math.log(self.E_sent[v]) if v != '<S>' else 0.0
+
+        r = log_p[:, v_vid] - log_p[:, u_vid] + log_E_u - log_E_v
+        return float(np.mean(r < -epsilon))
+
+    def _estimate_noise_sigma(self, terminal_log_p, candidates, epsilon,
+                              n_calibration=80):
+        """Estimate the noise parameter sigma from the data.
+
+        Model: for same-NT words (a, b) with corpus frequencies f_a, f_b,
+        the per-context log-ratio r_i ~ N(0, sigma^2 * (1/f_a + 1/f_b)).
+        The expected violation fraction is Phi(-eps / (sigma * sqrt(...))).
+
+        Calibrates sigma from the smallest nonzero pairwise violation
+        fractions among the most frequent candidates (which are most
+        likely same-NT pairs).
+        """
+        from scipy.stats import norm
+
+        n = min(n_calibration, len(candidates))
+        cal = candidates[:n]
+
+        sigmas = []
+        for i, a in enumerate(cal):
+            for j, b in enumerate(cal):
+                if i >= j:
+                    continue
+                vf_ab = self._violation_fraction(
+                    terminal_log_p, a, b, epsilon)
+                vf_ba = self._violation_fraction(
+                    terminal_log_p, b, a, epsilon)
+                vf = min(vf_ab, vf_ba)
+                if vf <= 0 or vf >= 0.5:
+                    continue
+                z = norm.ppf(vf)
+                if z >= -0.01:
+                    continue
+                fa = self.word_counts.get(a, 1)
+                fb = self.word_counts.get(b, 1)
+                sigma = -epsilon / (z * math.sqrt(1.0 / fa + 1.0 / fb))
+                sigmas.append(sigma)
+
+        if not sigmas:
+            return 100.0  # conservative fallback
+        return float(np.percentile(sigmas, 75))
+
+    def _adaptive_vf_threshold(self, sigma, fa, fb, epsilon,
+                               confidence=0.99):
+        """Pair-specific violation fraction threshold under the null.
+
+        Under the null hypothesis (same distribution), the expected
+        violation fraction depends on the noise level (sigma) and word
+        frequencies. Returns the upper confidence bound.
+
+        Args:
+            sigma: estimated noise parameter from _estimate_noise_sigma.
+            fa, fb: corpus frequencies of the two words.
+            epsilon: log-ratio tolerance.
+            confidence: confidence level for the threshold.
+        """
+        from scipy.stats import norm
+
+        sigma_r = sigma * math.sqrt(1.0 / fa + 1.0 / fb)
+        vf_null = norm.cdf(-epsilon / sigma_r)
+        n_s = getattr(self, 'n_context_samples', 500)
+        se = math.sqrt(max(vf_null * (1 - vf_null) / n_s, 1e-10))
+        return vf_null + norm.ppf(confidence) * se
+
+    def _build_antichain(self, candidates, is_subset, is_larger_than_S,
+                         verbose=False):
+        """Build antichain of minimal elements under a subset relation.
+
+        Processes candidates in order (typically decreasing frequency).
+        Maintains an antichain: a set where no element is a subset of
+        another.
+
+        Args:
+            candidates: ordered list of terminal names.
+            is_subset: callable(a, b) -> bool, True if a ⊆ b.
+            is_larger_than_S: callable(a) -> bool, True if a > S.
+            verbose: print progress trace.
+
+        Returns:
+            list of antichain elements (excluding '<S>').
+        """
+        antichain = ['<S>']
+        if verbose:
+            print(f"  Init: <S> (boundary)")
+
+        for a in candidates:
+            smaller_than = []
+            equal_to = []
+            larger_than = []
+
+            for b in antichain:
+                if b == '<S>':
+                    if is_larger_than_S(a):
+                        larger_than.append(b)
+                    continue
+
+                a_sub_b = is_subset(a, b)
+                b_sub_a = is_subset(b, a)
+
+                if a_sub_b and not b_sub_a:
+                    smaller_than.append(b)
+                elif a_sub_b and b_sub_a:
+                    equal_to.append(b)
+                elif not a_sub_b and b_sub_a:
+                    larger_than.append(b)
+
+            freq = self.word_counts.get(a, 0)
+
+            if equal_to:
+                if verbose:
+                    print(f"  Skip {a:>10} (freq={freq:>7}): "
+                          f"equal to {equal_to[0]}")
+                continue
+
+            if larger_than:
+                if verbose:
+                    print(f"  Skip {a:>10} (freq={freq:>7}): "
+                          f"larger than {larger_than[0]}")
+                continue
+
+            if smaller_than:
+                for b in smaller_than:
+                    antichain.remove(b)
+                antichain.append(a)
+                if verbose:
+                    removed = [b for b in smaller_than if b != '<S>']
+                    print(f"  Add  {a:>10} (freq={freq:>7}): "
+                          f"replaces {removed if removed else ['<S>']}, "
+                          f"antichain size={len(antichain)}")
+                continue
+
+            antichain.append(a)
+            if verbose:
+                print(f"  Add  {a:>10} (freq={freq:>7}): "
+                      f"incomparable, antichain size={len(antichain)}")
+
+        return [w for w in antichain if w != '<S>']
+
+    # ==========================================================
+    # Anchor selection
+    # ==========================================================
+
+    def select_anchors_minimal(self, max_terminals=500, verbose=True,
+                               epsilon=1.5):
+        """Select anchors by finding terminals with minimal context
+        distributions using a quantile-based subset test with
+        self-calibrated frequency-adaptive thresholds.
+
+        For each pair (a, b), computes per-context log-ratios
+            r_i = log P(b|c_i) - log P(a|c_i) + log E(a) - log E(b)
+        and concludes a ⊆ b if the violation fraction is below a
+        pair-specific threshold that accounts for estimation noise.
+
+        The noise model assumes log P(w|c) estimation error scales as
+        sigma/sqrt(f_w). The constant sigma is self-calibrated from
+        the lowest pairwise violation fractions in the data.
+
+        Args:
+            max_terminals: only consider the top-N most frequent terminals.
+            verbose: print progress trace.
+            epsilon: tolerance for log-ratio violations.
 
         Returns:
             list of anchor words (excluding S).
         """
         assert self.single_model is not None, "Train single model first"
 
-        k = self.k
-
-        # --- 1. Select terminals to consider, sorted by frequency ---
+        # 1. Select candidate terminals, sorted by frequency
         terminals = sorted(self.vocab, key=lambda w: -self.word_counts.get(w, 0))
         terminals = [w for w in terminals if w in self.w2i][:max_terminals]
 
         if verbose:
             print(f"Selecting minimal-distribution anchors from "
-                  f"{len(terminals)} terminals (tau_low={tau_low}, "
-                  f"tau_high={tau_high})...")
+                  f"{len(terminals)} terminals (eps={epsilon})...")
 
-        # --- 2. Collect contexts for all terminals in one corpus pass ---
-        is_rnn = self._is_rnn_model()
-        terminal_set = set(terminals)
-        terminal_ctxs = {w: Counter() for w in terminals}
+        # 2. Precompute log-prob matrices
+        terminal_log_p = self._compute_terminal_log_probs(terminals)
+        candidates = [w for w in terminals if w in terminal_log_p]
 
-        if is_rnn:
-            for sent in self.sentences:
-                words = list(sent)
-                n = len(words)
-                for i in range(n):
-                    w = words[i]
-                    if w in terminal_set:
-                        left = tuple([BOUNDARY] + words[:i])
-                        right = tuple(words[i + 1:] + [BOUNDARY])
-                        terminal_ctxs[w][(left, right)] += 1
-        else:
-            for sent in self.sentences:
-                padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
-                for i in range(k, len(padded) - k):
-                    w = padded[i]
-                    if w in terminal_set:
-                        ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
-                        terminal_ctxs[w][ctx] += 1
+        # 3. Calibrate noise parameter
+        sigma = self._estimate_noise_sigma(
+            terminal_log_p, candidates, epsilon)
+        if verbose:
+            print(f"  Noise sigma = {sigma:.1f}")
 
-        # --- 3. Precompute neural log-probs per terminal ---
-        terminal_log_p = {}  # word -> (log_p_matrix, weights)
+        # 4. Define subset test and S-comparison
+        vf_floor = 0.10
 
-        for w in terminals:
-            ctxs = terminal_ctxs[w]
-            freq = {c: n for c, n in ctxs.items()
-                    if n >= self.min_context_count}
-            if len(freq) < 20:
-                freq = dict(ctxs.most_common(100))
-            if len(freq) == 0:
-                continue
+        def is_subset(a, b):
+            fa = self.word_counts.get(a, 1)
+            fb = self.word_counts.get(b, 1)
+            thresh = max(
+                self._adaptive_vf_threshold(sigma, fa, fb, epsilon),
+                vf_floor)
+            vf = self._violation_fraction(
+                terminal_log_p, a, b, epsilon)
+            return vf <= thresh
 
-            ctx_list = list(freq.keys())
-            counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
-            weights = counts / counts.sum()
-
-            with torch.no_grad():
-                if is_rnn:
-                    log_p_list = []
-                    for left_words, right_words in ctx_list:
-                        left_t = torch.tensor(
-                            [self.w2i.get(cw, 0) for cw in left_words],
-                            dtype=torch.long).unsqueeze(0)
-                        right_t = torch.tensor(
-                            [self.w2i.get(cw, 0) for cw in right_words],
-                            dtype=torch.long).unsqueeze(0)
-                        logits = self.single_model.forward_unpacked(
-                            left_t, right_t)
-                        log_p_list.append(
-                            torch.log_softmax(logits, dim=-1)[0].numpy())
-                    log_p = np.stack(log_p_list)
-                else:
-                    ctx_tensor = torch.zeros(
-                        len(ctx_list), 2 * k, dtype=torch.long)
-                    for ci, ctx in enumerate(ctx_list):
-                        for j, cw in enumerate(ctx):
-                            ctx_tensor[ci, j] = self.w2i.get(cw, 0)
-                    logits = self.single_model(ctx_tensor)
-                    log_p = torch.log_softmax(logits, dim=-1).numpy()
-
-            terminal_log_p[w] = (log_p, weights)
-
-        # --- 4. Synthetic S terminal: boundary-only context ---
-        bdy_id = self.w2i[BOUNDARY]
-        with torch.no_grad():
-            if is_rnn:
-                bdy_left = torch.tensor([[bdy_id]], dtype=torch.long)
-                bdy_right = torch.tensor([[bdy_id]], dtype=torch.long)
-                s_logits = self.single_model.forward_unpacked(
-                    bdy_left, bdy_right)
-            else:
-                s_ctx = torch.zeros(1, 2 * k, dtype=torch.long)
-                s_ctx[:, :] = bdy_id
-                s_logits = self.single_model(s_ctx)
-            s_log_p = torch.log_softmax(s_logits, dim=-1).numpy()
-        s_weights = np.array([1.0])
-        terminal_log_p['<S>'] = (s_log_p, s_weights)
-
-        # --- 5. Divergence helper ---
-        def d_renyi(u, v):
-            """D_alpha(u || v) using u's contexts."""
-            if u not in terminal_log_p or v not in self.w2i:
-                return float('inf')
-            log_p, weights = terminal_log_p[u]
-
-            if u == '<S>':
-                # S doesn't have a vocab id; use its boundary log-probs
-                # D(S || v): ratio of S's self-prediction to v's prediction
-                # under boundary context. S doesn't correspond to a word,
-                # so we skip D where u='<S>' -- it's only used as v.
-                return float('inf')
-
-            u_vid = self.w2i[u]
-            v_vid = self.w2i.get(v, None)
-            if v_vid is None:
-                return float('inf')
-
-            log_E_u = math.log(self.E_sent[u])
-            log_E_v = math.log(self.E_sent[v]) if v != '<S>' else 0.0
-
-            log_ratio = (log_p[:, u_vid] - log_p[:, v_vid]
-                         + log_E_v - log_E_u)
-
-            alpha = self.alpha
-            if alpha == float('inf'):
-                return float(np.max(log_ratio))
-            scaled = (alpha - 1) * log_ratio
-            max_s = np.max(scaled)
-            lse = max_s + np.log(
-                np.sum(weights * np.exp(scaled - max_s)))
-            return float(lse / (alpha - 1))
-
-        def d_renyi_from_s(v):
-            """D(<S> || v): divergence from S to v.
-
-            S's context distribution is a point mass on the boundary
-            context.  The divergence measures how well v is predicted
-            at boundary relative to its overall frequency.
-
-            Closed form:  D(S||v) = log E(v) - log P(v|boundary)
-            This is small when v is well-predicted at boundary
-            (S-like) and large otherwise.
-            """
-            if v not in self.w2i or v not in self.E_sent:
-                return float('inf')
-            log_p, _ = terminal_log_p['<S>']
-            v_vid = self.w2i[v]
-            log_pv_bdy = float(log_p[0, v_vid])
-            log_Ev = math.log(self.E_sent[v])
-            return log_Ev - log_pv_bdy
-
-        def d_renyi_to_s(a):
-            """D(a || <S>): divergence from terminal a to S.
-
-            Closed form using corpus statistics.  S generates only
-            length-1 sentences, so its context is pure boundary.
-            Across a's contexts, the fraction of mass at boundary
-            context is f = E_length1(a) / E_sent(a).
-
-            D(a||S) ≈ -log(f).  This is 0 when a appears only at
-            boundary (a ≡ S), and large/infinite when a rarely
-            appears as a length-1 sentence.
-            """
+        def is_larger_than_S(a):
             E_a = self.E_sent.get(a, 0)
             E1_a = self.E_length1.get(a, 0)
-            if E_a <= 0:
-                return float('inf')
-            f = E1_a / E_a
-            if f <= 0:
-                return float('inf')
-            return -math.log(f)
+            return E_a > 0 and E1_a / E_a > 1e-3
 
-        # --- 6. Main loop: build the antichain ---
-        # Antichain is a list of terminal names (including '<S>')
-        antichain = ['<S>']
+        # 5. Build antichain
+        selected = self._build_antichain(
+            candidates, is_subset, is_larger_than_S, verbose=verbose)
 
-        if verbose:
-            print(f"  Init: <S> (boundary)")
-
-        # Only process terminals that have precomputed log-probs
-        terminals_with_data = [w for w in terminals if w in terminal_log_p]
-
-        for a in terminals_with_data:
-            # Compare a to each element b in the antichain
-            smaller_than = []  # elements b where a < b
-            equal_to = []      # elements b where a == b
-            larger_than = []   # elements b where a > b
-
-            for b in antichain:
-                if b == '<S>':
-                    # S is an anchor with boundary-only context.
-                    # Any terminal that ever appears as a length-1
-                    # sentence contains S's distribution, so it is
-                    # strictly larger than S.
-                    E_a = self.E_sent.get(a, 0)
-                    E1_a = self.E_length1.get(a, 0)
-                    if E_a > 0 and E1_a / E_a > 1e-3:
-                        larger_than.append(b)
-                    # else: incomparable (never occurs as length-1)
-                    continue
-                else:
-                    d_ab = d_renyi(a, b)  # D(a || b)
-                    d_ba = d_renyi(b, a)  # D(b || a)
-
-                if d_ab < tau_low and d_ba > tau_high:
-                    # a's support ⊂ b's support: a is smaller
-                    smaller_than.append(b)
-                elif d_ab < tau_low and d_ba < tau_low:
-                    # Same support: equal
-                    equal_to.append(b)
-                elif d_ab > tau_high and d_ba < tau_low:
-                    # b's support ⊂ a's support: a is larger
-                    larger_than.append(b)
-                # else: incomparable
-
-            if equal_to:
-                # a is equivalent to something already in the list
-                if verbose:
-                    print(f"  Skip {a:>10} (freq={self.word_counts.get(a,0):>7}): "
-                          f"equal to {equal_to[0]}")
-                continue
-
-            if larger_than:
-                # a is larger than something in the list — not minimal
-                if verbose:
-                    print(f"  Skip {a:>10} (freq={self.word_counts.get(a,0):>7}): "
-                          f"larger than {larger_than[0]}")
-                continue
-
-            if smaller_than:
-                # a is smaller than some elements — remove them, add a
-                for b in smaller_than:
-                    antichain.remove(b)
-                antichain.append(a)
-                if verbose:
-                    removed = [b for b in smaller_than if b != '<S>']
-                    print(f"  Add  {a:>10} (freq={self.word_counts.get(a,0):>7}): "
-                          f"replaces {removed if removed else ['<S>']}, "
-                          f"antichain size={len(antichain)}")
-                continue
-
-            # Incomparable to everything — new minimal element
-            antichain.append(a)
-            if verbose:
-                print(f"  Add  {a:>10} (freq={self.word_counts.get(a,0):>7}): "
-                      f"incomparable, antichain size={len(antichain)}")
-
-        # --- 7. Extract anchors (exclude synthetic S) ---
-        selected = [w for w in antichain if w != '<S>']
-
+        # 6. Store results
         self.anchors = selected
-        n_nt = len(selected)
         self.nonterminals = ['S'] + [f'NT_{w}' for w in selected]
         self.anchor2nt = {w: f'NT_{w}' for w in selected}
 
         if verbose:
-            print(f"\nSelected {n_nt} minimal-distribution anchors: {selected}")
+            print(f"\nSelected {len(selected)} minimal-distribution "
+                  f"anchors: {selected}")
 
         return self.anchors
 
@@ -794,46 +924,27 @@ class NeuralLearner:
         return isinstance(self.single_model, RNNClozeModel)
 
     def _collect_anchor_contexts(self):
-        """Collect single-word contexts for each anchor, with counts.
+        """Collect contexts for anchors (one corpus pass, cached).
 
-        For RNN models, collects variable-length (left, right) contexts.
-        For fixed-width models, collects fixed-width context tuples.
-        Also always collects fixed-width contexts for binary xi estimation
-        (which uses the fixed-width pair model).
+        For RNN: stores occurrence positions per anchor.
+        For fixed-width: stores context Counter per anchor.
         """
-        self._anchor_ctxs = {}
-        for a in self.anchors:
-            self._anchor_ctxs[a] = Counter()
-
+        anchor_set = set(self.anchors)
         if self._is_rnn_model():
-            # Variable-length contexts for RNN single model
-            for sent in self.sentences:
-                words = list(sent)
-                n = len(words)
-                for i in range(n):
-                    w = words[i]
-                    if w in self._anchor_ctxs:
-                        left = tuple([BOUNDARY] + words[:i])
-                        right = tuple(words[i + 1:] + [BOUNDARY])
-                        self._anchor_ctxs[w][(left, right)] += 1
+            self._anchor_positions = self._collect_positions(anchor_set)
+            self._anchor_ctxs = None
+            self._rnn_sampled_cache = {}
         else:
-            k = self.k
-            for sent in self.sentences:
-                padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
-                for i in range(k, len(padded) - k):
-                    w = padded[i]
-                    if w in self._anchor_ctxs:
-                        ctx = tuple(padded[i - k:i] + padded[i + 1:i + k + 1])
-                        self._anchor_ctxs[w][ctx] += 1
+            self._anchor_ctxs = self._collect_fixed_contexts(anchor_set)
 
-    def _get_filtered_contexts(self, anchor):
-        """Get contexts for an anchor, filtered by frequency."""
-        ctxs = self._anchor_ctxs[anchor]
-        freq = {c: n for c, n in ctxs.items()
-                if n >= self.min_context_count}
-        if len(freq) < 20:
-            freq = dict(ctxs.most_common(100))
-        return freq
+    def _ensure_anchor_contexts(self):
+        """Ensure anchor contexts have been collected (lazy init)."""
+        if self._is_rnn_model():
+            if not hasattr(self, '_anchor_positions'):
+                self._collect_anchor_contexts()
+        else:
+            if not hasattr(self, '_anchor_ctxs'):
+                self._collect_anchor_contexts()
 
     def _collect_gap_counts(self, verbose=False):
         """Compute per-context correction for 1-gap vs 2-gap contexts.
@@ -925,42 +1036,30 @@ class NeuralLearner:
     def _compute_full_log_probs(self, anchor):
         """Compute full (n_ctx, vocab) log-prob matrix for an anchor's contexts.
 
-        Handles both fixed-width and RNN models.
+        For RNN: samples n_context_samples positions (cached).
+        For fixed-width: uses frequency-filtered contexts.
 
         Returns:
             (log_p, weights): log_p is (n_ctx, vocab) numpy array,
                               weights is (n_ctx,) numpy array.
         """
-        freq = self._get_filtered_contexts(anchor)
-        ctx_list = list(freq.keys())
-        counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
-        weights = counts / counts.sum()
-
-        with torch.no_grad():
-            if self._is_rnn_model():
-                log_p_list = []
-                for left_words, right_words in ctx_list:
-                    left_t = torch.tensor(
-                        [self.w2i.get(w, 0) for w in left_words],
-                        dtype=torch.long).unsqueeze(0)
-                    right_t = torch.tensor(
-                        [self.w2i.get(w, 0) for w in right_words],
-                        dtype=torch.long).unsqueeze(0)
-                    logits = self.single_model.forward_unpacked(left_t, right_t)
-                    log_p_list.append(
-                        torch.log_softmax(logits, dim=-1)[0].numpy())
-                log_p = np.stack(log_p_list)
-            else:
-                k = self.k
-                n_ctx = len(ctx_list)
-                ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
-                for ci, ctx in enumerate(ctx_list):
-                    for j, w in enumerate(ctx):
-                        ctx_tensor[ci, j] = self.w2i.get(w, 0)
-                logits = self.single_model(ctx_tensor)
-                log_p = torch.log_softmax(logits, dim=-1).numpy()
-
-        return log_p, weights
+        if self._is_rnn_model():
+            if anchor not in self._rnn_sampled_cache:
+                rng = np.random.RandomState(
+                    self.seed + hash(anchor) % (2**31))
+                result = self._rnn_log_probs_from_positions(
+                    self._anchor_positions[anchor],
+                    n_samples=self.n_context_samples, rng=rng)
+                if result is None:
+                    raise ValueError(f"No positions for anchor {anchor}")
+                self._rnn_sampled_cache[anchor] = result
+            return self._rnn_sampled_cache[anchor]
+        else:
+            result = self._fixed_log_probs_from_contexts(
+                self._anchor_ctxs[anchor])
+            if result is None:
+                raise ValueError(f"No contexts for anchor {anchor}")
+            return result
 
     def estimate_lexical_xi(self, verbose=True):
         """Estimate xi(A -> b) for all anchors A and terminals b.
@@ -976,7 +1075,7 @@ class NeuralLearner:
         if verbose:
             print("Estimating lexical xi parameters...")
 
-        self._collect_anchor_contexts()
+        self._ensure_anchor_contexts()
 
         self.lexical_xi = {}
 
@@ -1026,40 +1125,57 @@ class NeuralLearner:
         return pmi, e_bc
 
     def _prepare_anchor_contexts(self, anchor):
-        """Prepare context tensors, weights, and gap corrections for an anchor.
+        """Prepare context representations for binary xi estimation.
 
         For fixed-width models returns:
             (ctx_tensor, weights, n_ctx, gap_corrections):
             - ctx_tensor: (n_ctx, 2*k) long tensor of context word indices
             - weights: normalised context weights
             - n_ctx: number of contexts
-            - gap_corrections: numpy array of per-context log(P(1-gap)/P(2-gap)),
-              or None if _collect_gap_counts has not been called.
+            - gap_corrections: per-context log(P(1-gap)/P(2-gap)) or None.
 
         For RNN models returns:
-            (ctx_data, weights, n_ctx, gap_corrections):
+            (ctx_data, weights, n_ctx, None):
             - ctx_data: list of (left_tensor, right_tensor) pairs
-            - weights: normalised context weights
-            - n_ctx: number of contexts
-            - gap_corrections: always None (gap correction not used with RNN)
+            - weights: uniform normalised weights
+            - n_ctx: number of sampled contexts
         """
-        freq = self._get_filtered_contexts(anchor)
+        if self._is_rnn_model():
+            # Ensure sampled positions are cached (same as _compute_full_log_probs)
+            log_p, weights = self._compute_full_log_probs(anchor)
+            # Rebuild tensor pairs from cached positions
+            rng = np.random.RandomState(
+                self.seed + hash(anchor) % (2**31))
+            positions = self._anchor_positions[anchor]
+            N = self.n_context_samples
+            if len(positions) > N:
+                idx = rng.choice(len(positions), N, replace=False)
+                positions = [positions[i] for i in idx]
+            ctx_data = []
+            for si, wi in positions:
+                sent = self.sentences[si]
+                left = [BOUNDARY] + list(sent[:wi])
+                right = list(sent[wi + 1:]) + [BOUNDARY]
+                left_t = torch.tensor(
+                    [self.w2i.get(w, 0) for w in left],
+                    dtype=torch.long).unsqueeze(0)
+                right_t = torch.tensor(
+                    [self.w2i.get(w, 0) for w in right],
+                    dtype=torch.long).unsqueeze(0)
+                ctx_data.append((left_t, right_t))
+            return ctx_data, weights, len(positions), None
+
+        # Fixed-width: build context tensor with gap corrections
+        ctxs = self._anchor_ctxs[anchor]
+        freq = {c: n for c, n in ctxs.items()
+                if n >= self.min_context_count}
+        if len(freq) < 20:
+            freq = dict(ctxs.most_common(100))
+
         ctx_list = list(freq.keys())
         counts = np.array([freq[c] for c in ctx_list], dtype=np.float64)
         weights = counts / counts.sum()
         n_ctx = len(ctx_list)
-
-        if self._is_rnn_model():
-            ctx_data = []
-            for left_words, right_words in ctx_list:
-                left_ids = torch.tensor(
-                    [self.w2i.get(w, 0) for w in left_words],
-                    dtype=torch.long).unsqueeze(0)
-                right_ids = torch.tensor(
-                    [self.w2i.get(w, 0) for w in right_words],
-                    dtype=torch.long).unsqueeze(0)
-                ctx_data.append((left_ids, right_ids))
-            return ctx_data, weights, n_ctx, None
 
         k = self.k
         ctx_tensor = torch.zeros(n_ctx, 2 * k, dtype=torch.long)
@@ -1321,9 +1437,7 @@ class NeuralLearner:
         if verbose:
             print("Estimating binary xi parameters...")
 
-        if not hasattr(self, '_anchor_ctxs'):
-            self._collect_anchor_contexts()
-
+        self._ensure_anchor_contexts()
         if not self._is_rnn_model():
             self._collect_gap_counts(verbose=verbose)
 
