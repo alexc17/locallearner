@@ -888,6 +888,39 @@ def rnn_collate_fn(batch):
     return left_padded, right_padded, left_lens, right_lens, targets
 
 
+class SentenceRNNDataset(Dataset):
+    """Dataset of whole sentences as token ID sequences.
+
+    Stores one entry per sentence rather than one per position,
+    enabling the model to share GRU computation across all positions
+    in a sentence (O(n) instead of O(n^2) per sentence).
+    """
+
+    def __init__(self, sentences, word2idx):
+        self.data = []
+        self.total_tokens = 0
+        for sent in sentences:
+            ids = np.array([word2idx.get(w, 0) for w in sent], dtype=np.int64)
+            self.data.append(ids)
+            self.total_tokens += len(ids)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.data[idx])
+
+
+def sentence_collate_fn(batch):
+    """Collate variable-length sentences into a padded batch."""
+    lengths = torch.tensor([len(s) for s in batch], dtype=torch.long)
+    max_len = lengths.max().item()
+    padded = torch.zeros(len(batch), max_len, dtype=torch.long)
+    for i, s in enumerate(batch):
+        padded[i, :len(s)] = s
+    return padded, lengths
+
+
 class RNNClozeModel(nn.Module):
     """Bidirectional RNN cloze model with variable-length contexts.
 
@@ -949,6 +982,78 @@ class RNNClozeModel(nn.Module):
         combined = torch.cat([h_L, h_R], dim=-1)  # (batch, 2*gru_dim)
         h = torch.relu(self.hidden(combined))
         return self.output(h)
+
+    def forward_sentence(self, sentences, lengths):
+        """Forward pass on whole sentences, sharing GRU computation.
+
+        Instead of processing each position independently (O(n^2) GRU
+        steps per sentence of length n), runs one left-to-right and one
+        right-to-left GRU pass per sentence (O(n) total).
+
+        Args:
+            sentences: (batch, max_len) int tensor of token IDs
+            lengths: (batch,) int tensor of sentence lengths
+
+        Returns:
+            logits: (N_valid, vocab_size) predictions at valid positions
+            targets: (N_valid,) ground truth token IDs
+        """
+        batch_size, max_len = sentences.shape
+        device = sentences.device
+        gap = self.gap
+
+        # Left input: [BDY, w_0, ..., w_{n-2}], same length as sentence.
+        # GRU output[i] = hidden after processing [BDY, w_0, ..., w_{i-1}].
+        left_input = torch.zeros_like(sentences)
+        # BDY is always index 0 in our vocabulary
+        if max_len > 1:
+            left_input[:, 1:] = sentences[:, :-1]
+
+        # Right input: reverse sentence, prepend BDY, length = n - gap.
+        # Full reversed seq = [BDY, w_{n-1}, ..., w_{1+gap}].
+        # GRU output[j] = hidden after [BDY, w_{n-1}, ..., w_{n-j}].
+        # Position i uses output[max(0, n-1-gap-i)].
+        idx = torch.arange(max_len, device=device).unsqueeze(0)
+        rev_idx = (lengths.unsqueeze(1) - 1 - idx).clamp(min=0)
+        reversed_sents = sentences.gather(1, rev_idx.expand(batch_size, -1))
+
+        right_input = torch.zeros(batch_size, max_len, dtype=torch.long,
+                                  device=device)
+        if max_len > 1:
+            right_input[:, 1:] = reversed_sents[:, :max_len - 1]
+        right_lengths = (lengths - gap).clamp(min=1)
+
+        # Embed and run GRUs
+        left_emb = self.embedding(left_input)
+        right_emb = self.embedding(right_input)
+
+        left_packed = nn.utils.rnn.pack_padded_sequence(
+            left_emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        left_out, _ = self.left_gru(left_packed)
+        left_out, _ = nn.utils.rnn.pad_packed_sequence(
+            left_out, batch_first=True)
+
+        right_packed = nn.utils.rnn.pack_padded_sequence(
+            right_emb, right_lengths.cpu(), batch_first=True,
+            enforce_sorted=False)
+        right_out, _ = self.right_gru(right_packed)
+        right_out, _ = nn.utils.rnn.pad_packed_sequence(
+            right_out, batch_first=True)
+
+        # Gather right hidden state for each position
+        right_idx = (lengths.unsqueeze(1) - 1 - gap - idx).clamp(
+            min=0, max=right_out.size(1) - 1)
+        right_h = right_out.gather(
+            1, right_idx.expand(batch_size, -1).unsqueeze(-1).expand(
+                -1, -1, self.gru_dim))
+
+        combined = torch.cat([left_out, right_h], dim=-1)
+        h = torch.relu(self.hidden(combined))
+        logits = self.output(h)
+
+        # Select valid positions only
+        mask = idx.squeeze(0) < lengths.unsqueeze(1)
+        return logits[mask], sentences[mask]
 
     def forward(self, left_padded, right_padded, left_lens, right_lens):
         """Forward pass with packed sequences for efficient training.
@@ -1028,15 +1133,17 @@ def train_rnn_cloze_model(sentences, embedding_dim=64, hidden_dim=128,
 
     gap_label = f" (gap={gap})" if gap > 0 else ""
     if verbose:
-        print(f"Extracting variable-length contexts{gap_label}...", flush=True)
+        print(f"Building sentence dataset{gap_label}...", flush=True)
     t0 = time.time()
-    dataset = RNNClozeDataset(sentences, word2idx, gap=gap)
+    dataset = SentenceRNNDataset(sentences, word2idx)
     if verbose:
-        print(f"  {len(dataset)} training examples ({time.time()-t0:.1f}s)", flush=True)
+        print(f"  {len(dataset)} sentences, {dataset.total_tokens} tokens "
+              f"({time.time()-t0:.1f}s)", flush=True)
 
+    use_pin = (device.type == 'cuda')
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                            num_workers=0, pin_memory=False,
-                            collate_fn=rnn_collate_fn)
+                            num_workers=0, pin_memory=use_pin,
+                            collate_fn=sentence_collate_fn)
 
     model = RNNClozeModel(vocab_size, embedding_dim, hidden_dim,
                           gru_dim, n_gru_layers, gap=gap).to(device)
@@ -1056,28 +1163,24 @@ def train_rnn_cloze_model(sentences, embedding_dim=64, hidden_dim=128,
     for epoch in range(n_epochs):
         model.train()
         total_loss = 0.0
-        n_batches = 0
+        total_tokens = 0
         t0 = time.time()
 
-        for left_pad, right_pad, left_lens, right_lens, targets in dataloader:
-            left_pad = left_pad.to(device)
-            right_pad = right_pad.to(device)
-            left_lens = left_lens.to(device)
-            right_lens = right_lens.to(device)
-            targets = targets.to(device)
+        for sents, lens in dataloader:
+            sents = sents.to(device)
+            lens = lens.to(device)
 
             optimizer.zero_grad()
-            logits = model(left_pad, right_pad, left_lens, right_lens)
+            logits, targets = model.forward_sentence(sents, lens)
             loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
 
-            batch_loss = loss.item()
-            total_loss += batch_loss
-            n_batches += 1
-            history['batch_losses'].append(batch_loss)
+            total_loss += loss.item() * targets.size(0)
+            total_tokens += targets.size(0)
+            history['batch_losses'].append(loss.item())
 
-        avg_loss = total_loss / n_batches
+        avg_loss = total_loss / total_tokens
         history['epoch_loss'].append(avg_loss)
         elapsed = time.time() - t0
 

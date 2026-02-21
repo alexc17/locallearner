@@ -18,11 +18,12 @@ config = config.json
 srcdir = ../locallearner
 
 # Extract values the Makefile needs from the config file.
-basedir      = $(shell python -c "import json; print(json.load(open('$(config)'))['basedir'])")
-pos_k        = $(shell python -c "import json; print(json.load(open('$(config)')).get('pipeline',{}).get('pos_k', 2))")
-corpus_n     = $(shell python -c "import json; print(json.load(open('$(config)')).get('corpus',{}).get('n_sentences', 1000000))")
-corpus_seed  = $(shell python -c "import json; print(json.load(open('$(config)')).get('corpus',{}).get('seed', 1))")
-ml_maxlength = $(shell python -c "import json; print(json.load(open('$(config)')).get('pipeline',{}).get('ml_maxlength', 10))")
+# Use 2>/dev/null so clean targets work even when config is absent.
+basedir      = $(shell python -c "import json; print(json.load(open('$(config)'))['basedir'])" 2>/dev/null)
+pos_k        = $(shell python -c "import json; print(json.load(open('$(config)')).get('pipeline',{}).get('pos_k', 2))" 2>/dev/null)
+corpus_n     = $(shell python -c "import json; print(json.load(open('$(config)')).get('corpus',{}).get('n_sentences', 1000000))" 2>/dev/null)
+corpus_seed  = $(shell python -c "import json; print(json.load(open('$(config)')).get('corpus',{}).get('seed', 1))" 2>/dev/null)
+ml_maxlength = $(shell python -c "import json; print(json.load(open('$(config)')).get('pipeline',{}).get('ml_maxlength', 10))" 2>/dev/null)
 
 grammars = $(sort $(notdir $(wildcard $(basedir)/g???)))
 
@@ -97,12 +98,12 @@ all : $(foreach g,$(grammars),$(basedir)/$(g)/neural_pipeline_results.json)
 	@for f in $(foreach g,$(grammars),$(basedir)/$(g)/neural_pipeline_results.json); do \
 		if [ -f "$$f" ]; then \
 			g=$$(basename $$(dirname $$f)); \
-			python -c "import json; d=json.load(open('$$f')); \
+			python -c "import json,sys; g=sys.argv[1]; d=json.load(open(sys.argv[2])); \
 				s=d.get('status','?'); nf=d.get('n_found_nts','?'); nt=d.get('n_target_nts','?'); \
 				ml=f\"{d['ml']['labeled_micro']:.4f}\" if 'ml' in d else '-'; \
 				init=f\"{d['init']['labeled_micro']:.4f}\" if 'init' in d else '-'; \
 				sgd=f\"{d['sgd']['labeled_micro']:.4f}\" if 'sgd' in d else '-'; \
-				print(f'  {g}: {nf}/{nt} NTs, {s}, ML={ml} init={init} sgd={sgd}')"; \
+				print(f'  {g}: {nf}/{nt} NTs, {s}, ML={ml} init={init} sgd={sgd}')" "$$g" "$$f"; \
 		fi; \
 	done
 
@@ -120,6 +121,7 @@ $(basedir)/%/.neural_kernels_done : $(basedir)/%/grammar.pcfg $(basedir)/%/corpu
 # ============================================================
 
 clean :
+	@test -n "$(basedir)" || { echo "ERROR: basedir not set. Use config=path/to/config.json or basedir=path/to/dir"; exit 1; }
 	rm -f $(basedir)/g???/neural_pipeline_results.json
 	rm -f $(basedir)/g???/.neural_kernels_done
 	rm -f $(basedir)/g???/neural_pipeline.log
@@ -130,6 +132,7 @@ clean :
 	rm -f $(basedir)/neural_pipeline_summary.json
 
 clean_models :
+	@test -n "$(basedir)" || { echo "ERROR: basedir not set. Use config=path/to/config.json or basedir=path/to/dir"; exit 1; }
 	rm -f $(basedir)/g???/rnn_cloze.pt
 	rm -f $(basedir)/g???/rnn_gap_cloze.pt
 	rm -f $(basedir)/g???/.rnn_trained
@@ -140,6 +143,7 @@ clean_models :
 	rm -f $(basedir)/g???/train_pos_k*.log
 
 clean_corpus :
+	@test -n "$(basedir)" || { echo "ERROR: basedir not set. Use config=path/to/config.json or basedir=path/to/dir"; exit 1; }
 	rm -f $(basedir)/g???/trees
 	rm -f $(basedir)/g???/corpus.txt
 	rm -f $(basedir)/g???/ml.pcfg
