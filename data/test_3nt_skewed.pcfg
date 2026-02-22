@@ -1,0 +1,49 @@
+# 3 non-start NTs (A, B, C), skewed frequency distribution.
+# A dominates: S -> A A has 60% probability, so A terminals are
+# much more frequent than B or C terminals. Shared terminals (x1-x4)
+# appear under multiple NTs with different probabilities.
+# Tests robustness to frequency imbalance.
+0.60 S -> A A
+0.25 S -> A B
+0.10 S -> B C
+0.05 S -> A C
+0.10 A -> A A
+0.05 A -> A B
+0.20 A -> a1
+0.15 A -> a2
+0.10 A -> a3
+0.08 A -> a4
+0.05 A -> a5
+0.04 A -> a6
+0.03 A -> a7
+0.02 A -> a8
+0.06 A -> x1
+0.05 A -> x2
+0.04 A -> x3
+0.03 A -> x4
+0.10 B -> B C
+0.05 B -> A B
+0.18 B -> b1
+0.12 B -> b2
+0.10 B -> b3
+0.08 B -> b4
+0.06 B -> b5
+0.05 B -> b6
+0.04 B -> b7
+0.03 B -> b8
+0.08 B -> x1
+0.06 B -> x3
+0.05 B -> x4
+0.10 C -> C B
+0.05 C -> A C
+0.20 C -> c1
+0.12 C -> c2
+0.10 C -> c3
+0.08 C -> c4
+0.06 C -> c5
+0.04 C -> c6
+0.03 C -> c7
+0.02 C -> c8
+0.10 C -> x2
+0.07 C -> x3
+0.03 C -> c9

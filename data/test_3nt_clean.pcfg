@@ -1,0 +1,49 @@
+# 3 non-start NTs (A, B, C), ~10 terminals each, minimal sharing.
+# Well-separated distributions: each NT has 10 unique terminals
+# plus 2 shared. Should be easy for any kernel selection method.
+0.40 S -> A B
+0.30 S -> B C
+0.20 S -> A C
+0.10 S -> C A
+0.15 A -> A B
+0.05 A -> B A
+0.15 A -> a1
+0.12 A -> a2
+0.10 A -> a3
+0.08 A -> a4
+0.07 A -> a5
+0.06 A -> a6
+0.05 A -> a7
+0.04 A -> a8
+0.04 A -> a9
+0.04 A -> a10
+0.03 A -> x1
+0.02 A -> x2
+0.10 B -> B C
+0.10 B -> C B
+0.15 B -> b1
+0.12 B -> b2
+0.10 B -> b3
+0.08 B -> b4
+0.07 B -> b5
+0.06 B -> b6
+0.05 B -> b7
+0.04 B -> b8
+0.04 B -> b9
+0.04 B -> b10
+0.03 B -> x1
+0.02 B -> x3
+0.10 C -> A C
+0.10 C -> C B
+0.15 C -> c1
+0.12 C -> c2
+0.10 C -> c3
+0.08 C -> c4
+0.07 C -> c5
+0.06 C -> c6
+0.05 C -> c7
+0.04 C -> c8
+0.04 C -> c9
+0.04 C -> c10
+0.03 C -> x2
+0.02 C -> x3

@@ -50,4 +50,7 @@ include = ["locallearner*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v"
+addopts = "-v -m 'not slow'"
+markers = [
+    "slow: slow integration tests (run with pytest -m slow)",
+]

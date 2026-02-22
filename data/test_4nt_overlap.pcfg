@@ -1,0 +1,66 @@
+# 4 non-start NTs (A, B, C, D), heavy terminal overlap.
+# 12 shared terminals (x1-x12) appear under 2-4 NTs each, plus
+# 6 unique terminals per NT. Tests subset detection and the
+# ability to distinguish genuinely different NTs when many
+# terminals are shared.
+0.30 S -> A B
+0.25 S -> C D
+0.20 S -> A D
+0.15 S -> B C
+0.10 S -> A C
+0.10 A -> A B
+0.15 A -> a1
+0.12 A -> a2
+0.08 A -> a3
+0.06 A -> a4
+0.05 A -> a5
+0.04 A -> a6
+0.10 A -> x1
+0.08 A -> x2
+0.06 A -> x3
+0.05 A -> x4
+0.04 A -> x5
+0.04 A -> x6
+0.03 A -> x7
+0.10 B -> C B
+0.15 B -> b1
+0.12 B -> b2
+0.08 B -> b3
+0.06 B -> b4
+0.05 B -> b5
+0.04 B -> b6
+0.10 B -> x1
+0.08 B -> x4
+0.06 B -> x7
+0.05 B -> x8
+0.04 B -> x6
+0.04 B -> x9
+0.03 B -> x10
+0.10 C -> A C
+0.15 C -> c1
+0.12 C -> c2
+0.08 C -> c3
+0.06 C -> c4
+0.05 C -> c5
+0.04 C -> c6
+0.10 C -> x2
+0.08 C -> x4
+0.06 C -> x5
+0.05 C -> x9
+0.04 C -> x6
+0.04 C -> x11
+0.03 C -> x12
+0.10 D -> B D
+0.15 D -> d1
+0.12 D -> d2
+0.08 D -> d3
+0.06 D -> d4
+0.05 D -> d5
+0.04 D -> d6
+0.10 D -> x3
+0.08 D -> x5
+0.06 D -> x8
+0.05 D -> x10
+0.04 D -> x6
+0.04 D -> x11
+0.03 D -> x12

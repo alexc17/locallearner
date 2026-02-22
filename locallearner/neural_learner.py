@@ -101,6 +101,8 @@ class NeuralLearner:
         self.single_model_file = None
         self.pair_model_file = None
         self.gap_model_file = None    # RNN gap model cache path
+        self.split_model_A_file = None  # split-half model A cache
+        self.split_model_B_file = None  # split-half model B cache
         self.kernels_file = None
 
         # State (populated during learning)
@@ -109,6 +111,8 @@ class NeuralLearner:
         self.single_model = None      # trained ClozeModel
         self.pair_model = None        # trained PairClozeModel
         self.gap_model = None         # RNN gap model (gap=1) for pair prediction
+        self.split_model_A = None     # split-half model A
+        self.split_model_B = None     # split-half model B
         self.w2i = None               # word -> index for neural models
         self.i2w = None               # index -> word for neural models
         self.anchors = None           # list of selected anchor words (excl S)
@@ -360,6 +364,79 @@ class NeuralLearner:
             save_model(model, w2i, i2w, self.gap_model_file,
                        k=0, history=history)
 
+    def train_split_models(self, verbose=True):
+        """Train two cloze models on independent halves of the corpus.
+
+        Used for split-half noise calibration of divergence estimates.
+        The full-corpus model must be trained first to provide the
+        shared vocabulary (w2i/i2w).
+
+        Stores models as self.split_model_A and self.split_model_B,
+        and split sentence lists as self._split_sentences_A/B.
+        """
+        assert self.w2i is not None, "Train full model first (need vocab)"
+        assert self._is_rnn_model(), "Split-half currently requires RNN model"
+
+        # Reproducible split
+        rng = np.random.RandomState(self.seed + 1000)
+        indices = rng.permutation(self.n_sentences)
+        half = self.n_sentences // 2
+        self._split_sentences_A = [self.sentences[i] for i in indices[:half]]
+        self._split_sentences_B = [self.sentences[i] for i in indices[half:]]
+
+        if verbose:
+            print(f"Split-half: {len(self._split_sentences_A)} + "
+                  f"{len(self._split_sentences_B)} sentences")
+
+        train_kwargs = dict(
+            embedding_dim=self.embedding_dim,
+            hidden_dim=self.hidden_dim,
+            gru_dim=self.hidden_dim,
+            n_epochs=self.n_epochs,
+            batch_size=self.batch_size,
+            lr=1e-3, min_count=1,
+            word2idx=self.w2i, idx2word=self.i2w,
+            verbose=verbose,
+        )
+
+        # Model A
+        if (self.split_model_A_file
+                and os.path.exists(self.split_model_A_file)):
+            result = load_model(self.split_model_A_file, device='cpu')
+            self.split_model_A = result[0]
+            if verbose:
+                print(f"  Loaded split model A from "
+                      f"{self.split_model_A_file}")
+        else:
+            if verbose:
+                print(f"  Training split model A...")
+            model_A, _, _, _ = train_rnn_cloze_model(
+                self._split_sentences_A,
+                seed=self.seed, **train_kwargs)
+            self.split_model_A = model_A.cpu()
+            if self.split_model_A_file:
+                save_model(self.split_model_A, self.w2i, self.i2w,
+                           self.split_model_A_file)
+
+        # Model B
+        if (self.split_model_B_file
+                and os.path.exists(self.split_model_B_file)):
+            result = load_model(self.split_model_B_file, device='cpu')
+            self.split_model_B = result[0]
+            if verbose:
+                print(f"  Loaded split model B from "
+                      f"{self.split_model_B_file}")
+        else:
+            if verbose:
+                print(f"  Training split model B...")
+            model_B, _, _, _ = train_rnn_cloze_model(
+                self._split_sentences_B,
+                seed=self.seed + 1, **train_kwargs)
+            self.split_model_B = model_B.cpu()
+            if self.split_model_B_file:
+                save_model(self.split_model_B, self.w2i, self.i2w,
+                           self.split_model_B_file)
+
     # ==========================================================
     # Step 3: Select anchors using Rényi divergences
     # ==========================================================
@@ -506,34 +583,40 @@ class NeuralLearner:
     # Context collection and log-prob computation
     # ==========================================================
 
-    def _collect_positions(self, word_set):
+    def _collect_positions(self, word_set, sentences=None):
         """Collect occurrence positions (sentence_idx, word_idx) for words.
 
         Args:
             word_set: set of words to collect positions for.
+            sentences: sentence list to search (default: self.sentences).
 
         Returns:
             dict mapping word -> list of (sentence_idx, word_idx).
         """
+        if sentences is None:
+            sentences = self.sentences
         positions = {w: [] for w in word_set}
-        for si, sent in enumerate(self.sentences):
+        for si, sent in enumerate(sentences):
             for wi, w in enumerate(sent):
                 if w in positions:
                     positions[w].append((si, wi))
         return positions
 
-    def _collect_fixed_contexts(self, word_set):
+    def _collect_fixed_contexts(self, word_set, sentences=None):
         """Collect fixed-width context tuples with counts for words.
 
         Args:
             word_set: set of words to collect contexts for.
+            sentences: sentence list to search (default: self.sentences).
 
         Returns:
             dict mapping word -> Counter of context_tuple -> count.
         """
+        if sentences is None:
+            sentences = self.sentences
         k = self.k
         ctxs = {w: Counter() for w in word_set}
-        for sent in self.sentences:
+        for sent in sentences:
             padded = [BOUNDARY] * k + list(sent) + [BOUNDARY] * k
             for i in range(k, len(padded) - k):
                 w = padded[i]
@@ -543,21 +626,28 @@ class NeuralLearner:
         return ctxs
 
     def _rnn_log_probs_from_positions(self, positions, n_samples=None,
-                                      rng=None):
+                                      rng=None, model=None, sentences=None):
         """Compute (log_p, weights) from occurrence positions using RNN.
 
         Optionally samples n_samples positions uniformly. Runs the
-        single model on each position's full-sentence context.
+        model on each position's full-sentence context.
 
         Args:
             positions: list of (sentence_idx, word_idx).
             n_samples: max positions to sample (None = use all).
             rng: numpy RandomState for sampling.
+            model: RNN model to use (default: self.single_model).
+            sentences: sentence list for context lookup
+                       (default: self.sentences).
 
         Returns:
             (log_p, weights) where log_p is (n_ctx, vocab) and
             weights is (n_ctx,), or None if no positions.
         """
+        if model is None:
+            model = self.single_model
+        if sentences is None:
+            sentences = self.sentences
         if not positions:
             return None
         if n_samples and len(positions) > n_samples and rng is not None:
@@ -567,7 +657,7 @@ class NeuralLearner:
         log_p_list = []
         with torch.no_grad():
             for si, wi in positions:
-                sent = self.sentences[si]
+                sent = sentences[si]
                 left = [BOUNDARY] + list(sent[:wi])
                 right = list(sent[wi + 1:]) + [BOUNDARY]
                 left_t = torch.tensor(
@@ -576,7 +666,7 @@ class NeuralLearner:
                 right_t = torch.tensor(
                     [self.w2i.get(w, 0) for w in right],
                     dtype=torch.long).unsqueeze(0)
-                logits = self.single_model.forward_unpacked(left_t, right_t)
+                logits = model.forward_unpacked(left_t, right_t)
                 log_p_list.append(
                     torch.log_softmax(logits, dim=-1)[0].numpy())
 
@@ -584,18 +674,21 @@ class NeuralLearner:
         weights = np.ones(len(log_p_list)) / len(log_p_list)
         return log_p, weights
 
-    def _fixed_log_probs_from_contexts(self, ctx_counter):
+    def _fixed_log_probs_from_contexts(self, ctx_counter, model=None):
         """Compute (log_p, weights) from a context Counter using fixed-width model.
 
         Filters by min_context_count, falls back to top-100 if too few pass.
 
         Args:
             ctx_counter: Counter mapping context_tuple -> count.
+            model: fixed-width model to use (default: self.single_model).
 
         Returns:
             (log_p, weights) where log_p is (n_ctx, vocab) and
             weights is (n_ctx,), or None if no contexts.
         """
+        if model is None:
+            model = self.single_model
         freq = {c: n for c, n in ctx_counter.items()
                 if n >= self.min_context_count}
         if len(freq) < 20:
@@ -614,12 +707,12 @@ class NeuralLearner:
                 ctx_tensor[ci, j] = self.w2i.get(w, 0)
 
         with torch.no_grad():
-            logits = self.single_model(ctx_tensor)
+            logits = model(ctx_tensor)
             log_p = torch.log_softmax(logits, dim=-1).numpy()
 
         return log_p, weights
 
-    def _compute_terminal_log_probs(self, words):
+    def _compute_terminal_log_probs(self, words, model=None, sentences=None):
         """Compute per-context log-prob matrices for a list of words.
 
         For RNN models, samples n_context_samples positions per word.
@@ -629,27 +722,36 @@ class NeuralLearner:
 
         Args:
             words: list of terminal words.
+            model: neural model to use (default: self.single_model).
+            sentences: sentence list for context collection
+                       (default: self.sentences).
 
         Returns:
             dict mapping word -> (log_p, weights) where
             log_p is (n_ctx, vocab) numpy array and
             weights is (n_ctx,) numpy array.
         """
+        if model is None:
+            model = self.single_model
+        if sentences is None:
+            sentences = self.sentences
         word_set = set(words)
         result = {}
 
         if self._is_rnn_model():
-            positions = self._collect_positions(word_set)
+            positions = self._collect_positions(word_set, sentences)
             rng = np.random.RandomState(self.seed)
             for w in words:
                 lp = self._rnn_log_probs_from_positions(
-                    positions[w], n_samples=self.n_context_samples, rng=rng)
+                    positions[w], n_samples=self.n_context_samples, rng=rng,
+                    model=model, sentences=sentences)
                 if lp is not None:
                     result[w] = lp
         else:
-            ctxs = self._collect_fixed_contexts(word_set)
+            ctxs = self._collect_fixed_contexts(word_set, sentences)
             for w in words:
-                lp = self._fixed_log_probs_from_contexts(ctxs[w])
+                lp = self._fixed_log_probs_from_contexts(ctxs[w],
+                                                          model=model)
                 if lp is not None:
                     result[w] = lp
 
@@ -659,12 +761,12 @@ class NeuralLearner:
             if self._is_rnn_model():
                 bdy_left = torch.tensor([[bdy_id]], dtype=torch.long)
                 bdy_right = torch.tensor([[bdy_id]], dtype=torch.long)
-                s_logits = self.single_model.forward_unpacked(
+                s_logits = model.forward_unpacked(
                     bdy_left, bdy_right)
             else:
                 s_ctx = torch.zeros(1, 2 * self.k, dtype=torch.long)
                 s_ctx[:, :] = bdy_id
-                s_logits = self.single_model(s_ctx)
+                s_logits = model(s_ctx)
             s_log_p = torch.log_softmax(s_logits, dim=-1).numpy()
         result['<S>'] = (s_log_p, np.array([1.0]))
 
@@ -912,6 +1014,341 @@ class NeuralLearner:
         if verbose:
             print(f"\nSelected {len(selected)} minimal-distribution "
                   f"anchors: {selected}")
+
+        return self.anchors
+
+    # ==========================================================
+    # Divergence-ordered anchor selection with split-half noise
+    # ==========================================================
+
+    def _compute_pairwise_renyi(self, terminal_log_p, candidates):
+        """Compute pairwise Rényi divergences D_α(a || b) for all pairs.
+
+        Args:
+            terminal_log_p: dict mapping word -> (log_p, weights).
+            candidates: list of candidate terminal words.
+
+        Returns:
+            dict mapping (a, b) -> D_α(a || b).
+        """
+        alpha = self.alpha
+        divergences = {}
+
+        for a in candidates:
+            if a not in terminal_log_p or a == '<S>':
+                continue
+            log_p_a, weights_a = terminal_log_p[a]
+            a_vid = self.w2i.get(a)
+            if a_vid is None:
+                continue
+            E_a = self.E_sent.get(a, 1e-10)
+            log_E_a = math.log(E_a)
+
+            for b in candidates:
+                if a == b:
+                    continue
+                b_vid = self.w2i.get(b)
+                if b_vid is None:
+                    continue
+                E_b = self.E_sent.get(b, 1e-10) if b != '<S>' else 1.0
+                log_E_b = math.log(E_b)
+
+                log_ratio = (log_p_a[:, a_vid] - log_p_a[:, b_vid]
+                             + log_E_b - log_E_a)
+
+                if alpha == float('inf'):
+                    divergences[(a, b)] = float(np.max(log_ratio))
+                else:
+                    scaled = (alpha - 1) * log_ratio
+                    max_s = float(np.max(scaled))
+                    lse = max_s + math.log(
+                        float(np.sum(weights_a * np.exp(scaled - max_s))))
+                    divergences[(a, b)] = lse / (alpha - 1)
+
+        return divergences
+
+    def select_anchors_divergence_ordered(self, max_terminals=300,
+                                          max_consecutive_rejects=20,
+                                          verbose=True):
+        """Select anchors using divergence-ordered greedy furthest-point
+        with split-half noise calibration and asymmetry filtering.
+
+        Instead of processing candidates in frequency order (like
+        select_anchors_minimal), uses the geometrically motivated
+        furthest-point algorithm:
+
+        1. Compute pairwise Rényi divergences from full model
+        2. Compute pairwise divergences from two split-half models
+        3. Estimate per-pair noise from split-half disagreement
+        4. Greedy furthest-point: always pick the candidate with the
+           highest noise-corrected minimum divergence from the current
+           anchor set
+        5. Apply asymmetry filter: reject candidates that look like
+           mixtures of already-selected anchors. A mixture w of anchor
+           s has D(s||w) small (bounded by log(1/fraction)) while
+           D(w||s) is large --- this asymmetric signature distinguishes
+           mixtures from genuinely new distributions.
+        6. Stop when:
+           - corrected distance drops to zero (noise dominates), or
+           - max_consecutive_rejects mixture rejections in a row
+             (all remaining candidates are mixtures)
+
+        Requires: train_single_model() and train_split_models() first.
+
+        Args:
+            max_terminals: consider top-N most frequent terminals.
+            max_consecutive_rejects: stop after this many consecutive
+                mixture rejections (default 20).
+            verbose: print progress trace.
+
+        Returns:
+            list of anchor words (excluding S).
+        """
+        assert self.single_model is not None, "Train single model first"
+        assert self.split_model_A is not None, "Train split models first"
+
+        # 1. Select candidate terminals
+        terminals = sorted(
+            self.vocab, key=lambda w: -self.word_counts.get(w, 0))
+        terminals = [w for w in terminals if w in self.w2i][:max_terminals]
+
+        if verbose:
+            print(f"Divergence-ordered anchor selection from "
+                  f"{len(terminals)} terminals...")
+
+        # 2. Compute log-probs from all three models
+        t0 = time.time()
+        if verbose:
+            print("  Computing log-probs (full model)...")
+        log_p_full = self._compute_terminal_log_probs(terminals)
+
+        if verbose:
+            print("  Computing log-probs (split model A)...")
+        log_p_A = self._compute_terminal_log_probs(
+            terminals, model=self.split_model_A,
+            sentences=self._split_sentences_A)
+
+        if verbose:
+            print("  Computing log-probs (split model B)...")
+        log_p_B = self._compute_terminal_log_probs(
+            terminals, model=self.split_model_B,
+            sentences=self._split_sentences_B)
+
+        candidates = [w for w in terminals
+                      if w in log_p_full
+                      and w in log_p_A and w in log_p_B]
+
+        if verbose:
+            print(f"  {len(candidates)} candidates with all three models "
+                  f"({time.time()-t0:.1f}s)")
+
+        # 3. Compute pairwise divergences from all three models
+        t0 = time.time()
+        if verbose:
+            print("  Computing pairwise divergences...")
+        div_full = self._compute_pairwise_renyi(log_p_full, candidates)
+        div_A = self._compute_pairwise_renyi(log_p_A, candidates)
+        div_B = self._compute_pairwise_renyi(log_p_B, candidates)
+
+        if verbose:
+            print(f"  {len(div_full)} directed pairs ({time.time()-t0:.1f}s)")
+
+        # 4. Estimate per-pair noise from split-half disagreement
+        noise = {}
+        for key in div_full:
+            d_A = div_A.get(key, 0)
+            d_B = div_B.get(key, 0)
+            noise[key] = abs(d_A - d_B)
+
+        noise_vals = [v for v in noise.values() if v > 0]
+        if noise_vals:
+            median_noise = float(np.median(noise_vals))
+            p75_noise = float(np.percentile(noise_vals, 75))
+        else:
+            median_noise = p75_noise = 0.0
+
+        if verbose:
+            print(f"  Split-half noise: median={median_noise:.3f}, "
+                  f"p75={p75_noise:.3f}")
+
+        # 5. Corrected symmetric distance function
+        # Use median noise as a floor: split-half captures data noise
+        # but not model noise (random seed initialization). The median
+        # noise across all pairs provides a robust floor that accounts
+        # for irreducible model-level noise.
+        def corrected_distance(a, b):
+            """Min-direction divergence minus noise (with floor)."""
+            d_ab = div_full.get((a, b), 0)
+            d_ba = div_full.get((b, a), 0)
+            n_ab = max(noise.get((a, b), p75_noise), median_noise)
+            n_ba = max(noise.get((b, a), p75_noise), median_noise)
+            return min(d_ab - n_ab, d_ba - n_ba)
+
+        def is_mixture(w, selected):
+            """Test whether w looks like a mixture of selected anchors.
+
+            A mixture w of anchor s satisfies:
+              D(s||w) << D(w||s)  (strong asymmetry)
+
+            The asymmetry ratio D(w||s)/D(s||w) is:
+              ~1 for same-NT pairs (both small, symmetric)
+              ~1 for cross-NT pairs (both large, symmetric)
+              3-10x for mixtures (forward small, reverse large)
+
+            We require ratio > 3 AND the reverse divergence must be
+            clearly above noise (to avoid false positives from pairs
+            where both divergences are near zero and the ratio is
+            dominated by noise).
+
+            For common anchors, D(s||w) is well-estimated (uses
+            anchor's many contexts), so this test is reliable even
+            when w is rare.
+
+            For very rare w, the noise on D(w||s) is large, which
+            makes the noise-floor condition harder to satisfy -- this
+            is conservative (avoids false rejections of genuine
+            anchors).
+            """
+            for s in selected:
+                d_sw = div_full.get((s, w), 0)  # anchor -> candidate
+                d_ws = div_full.get((w, s), 0)  # candidate -> anchor
+                n_sw = noise.get((s, w), p75_noise)
+                n_ws = noise.get((w, s), p75_noise)
+
+                # Asymmetry ratio: high for mixtures, ~1 otherwise
+                ratio = d_ws / max(d_sw, 1e-6)
+
+                # Noise floor: reverse divergence must be clearly
+                # above noise for the ratio to be meaningful
+                reverse_reliable = d_ws > max(n_ws, n_sw)
+
+                if ratio > 3.0 and reverse_reliable:
+                    return True, s, d_sw, d_ws, n_sw, n_ws
+            return False, None, 0, 0, 0, 0
+
+        # 6. Initialize: pick most frequent terminal
+        # Genuine anchors have higher individual frequency than
+        # mixture terminals whose probability mass is split across NTs.
+        # This avoids contaminating the seed with a shared terminal.
+        non_s = [w for w in candidates if w != '<S>']
+        if not non_s:
+            self.anchors = []
+            return []
+
+        best_start = max(non_s,
+                         key=lambda w: self.word_counts.get(w, 0))
+
+        selected = [best_start]
+        remaining = set(non_s) - {best_start}
+        rejected = set()
+        consecutive_rejects = 0
+
+        if verbose:
+            freq = self.word_counts.get(best_start, 0)
+            print(f"\n  Init: {best_start:>10} (freq={freq:>7})")
+
+        # 7. Greedy furthest-point with asymmetry filter
+        while remaining:
+            best_w = None
+            best_min_d = -float('inf')
+
+            for w in remaining:
+                if w in rejected:
+                    continue
+                min_d = min(corrected_distance(w, s) for s in selected)
+                if min_d > best_min_d:
+                    best_min_d = min_d
+                    best_w = w
+
+            # Distance-based stopping: noise dominates
+            if best_w is None or best_min_d <= 0:
+                if verbose:
+                    print(f"  Stop: best corrected distance = "
+                          f"{best_min_d:.3f} <= 0")
+                break
+
+            # Asymmetry filter: reject mixtures
+            mix, mix_anchor, d_sw, d_ws, n_sw, n_ws = is_mixture(
+                best_w, selected)
+
+            if mix:
+                rejected.add(best_w)
+                remaining.discard(best_w)
+                consecutive_rejects += 1
+
+                if verbose:
+                    freq = self.word_counts.get(best_w, 0)
+                    ratio = d_ws / max(d_sw, 1e-6)
+                    print(f"  Reject: {best_w:>10} (freq={freq:>7}, "
+                          f"mixture of {mix_anchor}, "
+                          f"D(s||w)={d_sw:.3f}, D(w||s)={d_ws:.3f}, "
+                          f"ratio={ratio:.1f}x)")
+
+                if consecutive_rejects >= max_consecutive_rejects:
+                    if verbose:
+                        print(f"  Stop: {max_consecutive_rejects} "
+                              f"consecutive mixture rejections")
+                    break
+                continue
+
+            # Accept this candidate as a new anchor
+            selected.append(best_w)
+            remaining.discard(best_w)
+            consecutive_rejects = 0
+
+            if verbose:
+                freq = self.word_counts.get(best_w, 0)
+                # Show raw and corrected for diagnostics
+                raw_min = min(
+                    min(div_full.get((best_w, s), 0),
+                        div_full.get((s, best_w), 0))
+                    for s in selected[:-1])
+                print(f"  Add:  {best_w:>10} (freq={freq:>7}, "
+                      f"raw={raw_min:.3f}, corrected={best_min_d:.3f}, "
+                      f"n={len(selected)})")
+
+        # 8. Retroactive mixture check
+        # The seed was selected without any reference set for mixture
+        # detection.  Now that we have the full anchor set, check
+        # every anchor against all OTHERS.  This catches cases where
+        # the seed (most frequent terminal) is itself a shared word.
+        pruned = list(selected)
+        retroactive_rejected = []
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(pruned)):
+                others = pruned[:i] + pruned[i+1:]
+                if not others:
+                    continue
+                mix, mix_anchor, d_sw, d_ws, n_sw, n_ws = is_mixture(
+                    pruned[i], others)
+                if mix:
+                    if verbose:
+                        ratio = d_ws / max(d_sw, 1e-6)
+                        print(f"  Retroactive reject: {pruned[i]:>10} "
+                              f"(mixture of {mix_anchor}, "
+                              f"D(s||w)={d_sw:.3f}, "
+                              f"D(w||s)={d_ws:.3f}, "
+                              f"ratio={ratio:.1f}x)")
+                    retroactive_rejected.append(pruned[i])
+                    pruned.pop(i)
+                    changed = True
+                    break
+
+        selected = pruned
+        rejected = rejected | set(retroactive_rejected)
+
+        # 9. Store results
+        self.anchors = selected
+        self.nonterminals = ['S'] + [f'NT_{w}' for w in selected]
+        self.anchor2nt = {w: f'NT_{w}' for w in selected}
+
+        if verbose:
+            print(f"\nSelected {len(selected)} anchors: {selected}")
+            if rejected:
+                print(f"Rejected {len(rejected)} mixtures: "
+                      f"{sorted(rejected)}")
 
         return self.anchors
 
