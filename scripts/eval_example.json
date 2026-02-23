@@ -1,5 +1,7 @@
 {
+  "output": "eval_results.json",
   "workdir": "./eval_output",
+  "quiet": false,
   "grammars": {
     "n_nonterminals": [5],
     "n_terminals": 1000,

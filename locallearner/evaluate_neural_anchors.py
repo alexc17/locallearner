@@ -4,20 +4,17 @@
 Supports multiple methods (neural models, gold kernels, supervised MLE,
 target ceiling) on the same grammars and corpora for fair comparison.
 
-Usage with config file (recommended):
-    python3 evaluate_neural_anchors.py results.json --config experiment.json
+Usage (config file, recommended):
+    python3 evaluate_neural_anchors.py --config experiment.json
 
-Save intermediate files to a persistent directory:
-    python3 evaluate_neural_anchors.py results.json --config experiment.json --workdir ./experiments
-
-Usage with CLI args (backward compatible, single rnn_div method):
-    python3 evaluate_neural_anchors.py results.json
-    python3 evaluate_neural_anchors.py results.json --n_grammars 5 --n_sentences 100000
-    python3 evaluate_neural_anchors.py results.json --nonterminals 5 8 10
+All settings live in the config JSON for reproducibility.  CLI flags
+override config values when given.
 
 Config file format:
     {
+      "output": "results.json",
       "workdir": "./eval_output",
+      "quiet": false,
       "grammars": {
         "n_nonterminals": [5],
         "n_terminals": 1000,
@@ -34,8 +31,7 @@ Config file format:
       ]
     }
 
-    "workdir" is optional; if omitted, files go to a temp directory.
-    CLI --workdir overrides the config value.
+CLI flags (--output, --workdir, --quiet) override the config values.
 """
 
 import sys
@@ -557,7 +553,11 @@ def print_summary(results):
 # ── Config loading ──────────────────────────────────────────────────
 
 def load_config(config_path):
-    """Load experiment config from JSON file."""
+    """Load experiment config from JSON file.
+
+    Required fields: grammars.n_nonterminals, methods.
+    Optional top-level fields: output, workdir, quiet.
+    """
     with open(config_path) as f:
         cfg = json.load(f)
 
@@ -592,66 +592,35 @@ def load_config(config_path):
     return cfg
 
 
-def config_from_cli_args(args):
-    """Build a config dict from CLI arguments (backward compatibility)."""
-    return {
-        'grammars': {
-            'n_nonterminals': args.nonterminals,
-            'n_terminals': args.terminals,
-            'n_grammars': args.n_grammars,
-            'n_sentences': args.n_sentences,
-            'base_seed': args.base_seed,
-        },
-        'methods': [
-            {
-                'name': 'rnn_div',
-                'kernel_method': 'divergence_ordered',
-                'model_type': 'rnn',
-                'epochs': args.epochs,
-                'alpha': args.alpha,
-            }
-        ],
-    }
-
-
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate anchor selection methods on random PCFGs")
-    parser.add_argument('output', help='Output JSON file for results')
-    parser.add_argument('--config', type=str, default=None,
-                        help='JSON config file (overrides other args)')
+        description="Evaluate anchor selection methods on random PCFGs. "
+        "All settings are in a JSON config file; CLI flags override.")
+    parser.add_argument('--config', type=str, required=True,
+                        help='JSON config file (required)')
+    parser.add_argument('--output', type=str, default=None,
+                        help='Output JSON file (overrides config)')
     parser.add_argument('--workdir', type=str, default=None,
                         help='Directory for intermediate files '
-                        '(default: temp dir)')
-
-    # CLI args for backward compatibility (used when --config not given)
-    parser.add_argument('--nonterminals', type=int, nargs='+',
-                        default=[5, 8, 10],
-                        help='Numbers of nonterminals (default: 5 8 10)')
-    parser.add_argument('--terminals', type=int, default=1000,
-                        help='Number of terminals (default: 1000)')
-    parser.add_argument('--n_grammars', type=int, default=3,
-                        help='Random grammars per size (default: 3)')
-    parser.add_argument('--n_sentences', type=int, default=100000,
-                        help='Corpus size (default: 100000)')
-    parser.add_argument('--alpha', type=float, default=2.0,
-                        help='Renyi divergence alpha (default: 2.0)')
-    parser.add_argument('--epochs', type=int, default=20,
-                        help='RNN training epochs (default: 20)')
-    parser.add_argument('--base_seed', type=int, default=1,
-                        help='Starting seed (default: 1)')
-    parser.add_argument('--quiet', action='store_true',
-                        help='Suppress detailed output')
+                        '(overrides config)')
+    parser.add_argument('--quiet', action='store_true', default=None,
+                        help='Suppress detailed output (overrides config)')
 
     args = parser.parse_args()
+    cfg = load_config(args.config)
 
-    # Load or build config
-    if args.config:
-        cfg = load_config(args.config)
-    else:
-        cfg = config_from_cli_args(args)
+    # Resolve settings: CLI overrides config
+    output = args.output or cfg.get('output', 'results.json')
+    workdir = args.workdir or cfg.get('workdir', None)
+    quiet = args.quiet if args.quiet is not None else cfg.get('quiet', False)
+
+    if workdir is not None:
+        workdir = os.path.abspath(workdir)
+        os.makedirs(workdir, exist_ok=True)
+        if not quiet:
+            print(f"Work directory: {workdir}")
 
     g = cfg['grammars']
     methods = cfg['methods']
@@ -661,13 +630,13 @@ def main():
     n_sentences = g.get('n_sentences', 100000)
     base_seed = g.get('base_seed', 1)
 
-    # Workdir: CLI --workdir overrides config "workdir"
-    workdir = args.workdir or cfg.get('workdir', None)
-    if workdir is not None:
-        workdir = os.path.abspath(workdir)
-        os.makedirs(workdir, exist_ok=True)
-        if not args.quiet:
-            print(f"Work directory: {workdir}")
+    if not quiet:
+        print(f"Config: {args.config}")
+        print(f"Output: {output}")
+        print(f"Grammars: {n_nonterminals_list} NTs, {n_terminals} terminals, "
+              f"{n_grammars} per size, {n_sentences} sentences, "
+              f"seed={base_seed}")
+        print(f"Methods: {', '.join(m['name'] for m in methods)}")
 
     # Build grammar configs
     grammar_configs = []
@@ -687,14 +656,14 @@ def main():
     all_results = []
     total = len(grammar_configs)
     for i, gc in enumerate(grammar_configs):
-        if not args.quiet:
+        if not quiet:
             print(f"\n[{i+1}/{total}]", end='')
-        results = run_experiment(gc, methods, verbose=not args.quiet,
+        results = run_experiment(gc, methods, verbose=not quiet,
                                  workdir=workdir)
         all_results.extend(results)
 
         # Save incrementally
-        with open(args.output, 'w') as f:
+        with open(output, 'w') as f:
             json.dump(all_results, f, indent=2)
 
     # Print summary
