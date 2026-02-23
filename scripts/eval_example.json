@@ -1,0 +1,54 @@
+{
+  "workdir": "./eval_output",
+  "grammars": {
+    "n_nonterminals": [5],
+    "n_terminals": 1000,
+    "n_grammars": 5,
+    "n_sentences": 100000,
+    "base_seed": 1
+  },
+  "methods": [
+    {
+      "name": "rnn_div",
+      "kernel_method": "divergence_ordered",
+      "model_type": "rnn",
+      "epochs": 20,
+      "alpha": 2.0,
+      "embedding_dim": 64,
+      "hidden_dim": 128,
+      "max_terminals": 300
+    },
+    {
+      "name": "bow_minimal",
+      "kernel_method": "minimal",
+      "model_type": "bow",
+      "epochs": 20,
+      "alpha": 2.0,
+      "max_terminals": 500,
+      "epsilon": 1.5
+    },
+    {
+      "name": "pos_minimal",
+      "kernel_method": "minimal",
+      "model_type": "positional",
+      "k": 2,
+      "epochs": 20,
+      "alpha": 2.0,
+      "max_terminals": 500,
+      "epsilon": 1.5
+    },
+    {
+      "name": "gold",
+      "kernel_method": "gold"
+    },
+    {
+      "name": "supervised",
+      "kernel_method": "supervised",
+      "ml_maxlength": 10
+    },
+    {
+      "name": "target",
+      "kernel_method": "target"
+    }
+  ]
+}

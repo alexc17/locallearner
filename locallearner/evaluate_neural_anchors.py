@@ -7,6 +7,9 @@ target ceiling) on the same grammars and corpora for fair comparison.
 Usage with config file (recommended):
     python3 evaluate_neural_anchors.py results.json --config experiment.json
 
+Save intermediate files to a persistent directory:
+    python3 evaluate_neural_anchors.py results.json --config experiment.json --workdir ./experiments
+
 Usage with CLI args (backward compatible, single rnn_div method):
     python3 evaluate_neural_anchors.py results.json
     python3 evaluate_neural_anchors.py results.json --n_grammars 5 --n_sentences 100000
@@ -14,6 +17,7 @@ Usage with CLI args (backward compatible, single rnn_div method):
 
 Config file format:
     {
+      "workdir": "./eval_output",
       "grammars": {
         "n_nonterminals": [5],
         "n_terminals": 1000,
@@ -29,6 +33,9 @@ Config file format:
         {"name": "target", "kernel_method": "target"}
       ]
     }
+
+    "workdir" is optional; if omitted, files go to a temp directory.
+    CLI --workdir overrides the config value.
 """
 
 import sys
@@ -346,8 +353,17 @@ def run_method_target(method, target, verbose):
 
 # ── Main experiment loop ────────────────────────────────────────────
 
-def run_experiment(grammar_config, methods, verbose=True):
-    """Run all methods on a single grammar. Returns list of result dicts."""
+def run_experiment(grammar_config, methods, verbose=True, workdir=None):
+    """Run all methods on a single grammar. Returns list of result dicts.
+
+    Args:
+        grammar_config: dict with grammar parameters
+        methods: list of method dicts
+        verbose: print progress
+        workdir: if set, use this as the base directory and create a
+            subdirectory for this grammar (e.g. workdir/nt5_s1/).
+            If None, use a temporary directory.
+    """
     n_nt = grammar_config['n_nonterminals']
     n_t = grammar_config['n_terminals']
     n_sentences = grammar_config['n_sentences']
@@ -362,7 +378,11 @@ def run_experiment(grammar_config, methods, verbose=True):
 
     grammar = generate_grammar(n_nt, n_t, grammar_seed)
 
-    tmpdir = tempfile.mkdtemp(prefix='eval_anchors_')
+    if workdir is not None:
+        tmpdir = os.path.join(workdir, f'nt{n_nt}_s{grammar_seed}')
+        os.makedirs(tmpdir, exist_ok=True)
+    else:
+        tmpdir = tempfile.mkdtemp(prefix='eval_anchors_')
     if verbose:
         print(f"  Working directory: {tmpdir}")
 
@@ -602,6 +622,9 @@ def main():
     parser.add_argument('output', help='Output JSON file for results')
     parser.add_argument('--config', type=str, default=None,
                         help='JSON config file (overrides other args)')
+    parser.add_argument('--workdir', type=str, default=None,
+                        help='Directory for intermediate files '
+                        '(default: temp dir)')
 
     # CLI args for backward compatibility (used when --config not given)
     parser.add_argument('--nonterminals', type=int, nargs='+',
@@ -638,6 +661,14 @@ def main():
     n_sentences = g.get('n_sentences', 100000)
     base_seed = g.get('base_seed', 1)
 
+    # Workdir: CLI --workdir overrides config "workdir"
+    workdir = args.workdir or cfg.get('workdir', None)
+    if workdir is not None:
+        workdir = os.path.abspath(workdir)
+        os.makedirs(workdir, exist_ok=True)
+        if not args.quiet:
+            print(f"Work directory: {workdir}")
+
     # Build grammar configs
     grammar_configs = []
     seed = base_seed
@@ -658,7 +689,8 @@ def main():
     for i, gc in enumerate(grammar_configs):
         if not args.quiet:
             print(f"\n[{i+1}/{total}]", end='')
-        results = run_experiment(gc, methods, verbose=not args.quiet)
+        results = run_experiment(gc, methods, verbose=not args.quiet,
+                                 workdir=workdir)
         all_results.extend(results)
 
         # Save incrementally
